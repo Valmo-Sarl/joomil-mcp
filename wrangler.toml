@@ -5,3 +5,11 @@ compatibility_flags = ["nodejs_compat"]
 
 [vars]
 JOOMIL_API_BASE = "https://www.joomil.ch"
+
+[[durable_objects.bindings]]
+name = "JoomilMCP"
+class_name = "JoomilMCP"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["JoomilMCP"]

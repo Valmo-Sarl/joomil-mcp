@@ -78,6 +78,11 @@ export class JoomilMCP extends McpAgent<Env> {
           "Returns a paginated list of public listings with title, description (truncated to 300 chars), price, location, category and vendor info. " +
           "All parameters are optional — call with no arguments to browse the latest listings. " +
           "Use get_classified to fetch full details of a specific listing.",
+        annotations: {
+          title: "Search Classifieds",
+          readOnlyHint: true,
+          destructiveHint: false,
+        },
         inputSchema: {
           q: z
             .string()
@@ -162,6 +167,11 @@ export class JoomilMCP extends McpAgent<Env> {
           "Returns complete description, all images URLs, category breadcrumb (full_path), " +
           "vendor info (name, certified status, pro company), expiry date and boost level. " +
           "Use search_classifieds first to find relevant listing IDs.",
+        annotations: {
+          title: "Get Classified",
+          readOnlyHint: true,
+          destructiveHint: false,
+        },
         inputSchema: {
           id: z
             .number()
@@ -190,6 +200,11 @@ export class JoomilMCP extends McpAgent<Env> {
           "Returns a flat list with parent_id for hierarchy reconstruction. " +
           "Omit parent_id for all categories, use parent_id=0 for root categories only, " +
           "or pass a specific ID to get direct children of that category.",
+        annotations: {
+          title: "Get Categories",
+          readOnlyHint: true,
+          destructiveHint: false,
+        },
         inputSchema: {
           parent_id: z
             .number()

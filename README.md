@@ -2,7 +2,7 @@
 
 > MCP server for [Joomil.ch](https://www.joomil.ch) — Switzerland's leading French-speaking classifieds marketplace, active since 2007.
 
-Browse and search 2,000+ active listings across 34 categories: real estate, vehicles, jobs, animals, electronics, fashion and more — all from Switzerland's French-speaking regions.
+Browse and search 45,000+ active listings across 34 categories: real estate, vehicles, jobs, animals, electronics, fashion and more — all from Switzerland's French-speaking regions (Romandie).
 
 ## Tools
 
@@ -82,7 +82,7 @@ Add to your MCP settings:
 ## Data
 
 - **Source**: Joomil.ch public REST API
-- **Coverage**: ~2,000 active listings, 34 top-level categories, 190,000+ registered users
+- **Coverage**: 45,000+ active listings, 34 top-level categories, 190,000+ registered users
 - **Location**: Switzerland (French-speaking regions — Romandie)
 - **Language**: French
 - **Update frequency**: Real-time

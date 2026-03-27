@@ -76,6 +76,7 @@ export class JoomilMCP extends McpAgent<Env> {
         description:
           "Search classified ads on Joomil.ch — Switzerland's leading French-speaking classifieds marketplace (since 2007). " +
           "Returns a paginated list of public listings with title, description (truncated to 300 chars), price, location, category and vendor info. " +
+          "All parameters are optional — call with no arguments to browse the latest listings. " +
           "Use get_classified to fetch full details of a specific listing.",
         inputSchema: {
           q: z

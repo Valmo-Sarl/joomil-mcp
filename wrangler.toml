@@ -1,0 +1,7 @@
+name = "joomil-mcp"
+main = "src/index.ts"
+compatibility_date = "2025-03-27"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+JOOMIL_API_BASE = "https://www.joomil.ch"

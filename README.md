@@ -16,6 +16,8 @@ Browse and search 45,000+ active listings across 34 categories: real estate, veh
 
 This is a **remote MCP server** — no local installation required.
 
+**Endpoint:** `https://joomil-mcp.snowy-surf-deec.workers.dev/mcp`
+
 ### Claude Desktop
 
 Add to `~/.claude/claude_desktop_config.json`:

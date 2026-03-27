@@ -32,7 +32,7 @@ Add to your `claude_desktop_config.json`:
       "command": "npx",
       "args": [
         "mcp-remote",
-        "https://joomil-mcp.YOUR_ACCOUNT.workers.dev/mcp"
+        "https://joomil-mcp.snowy-surf-deec.workers.dev/mcp"
       ]
     }
   }
@@ -46,7 +46,7 @@ Add to your MCP settings:
 ```json
 {
   "joomil": {
-    "url": "https://joomil-mcp.YOUR_ACCOUNT.workers.dev/mcp"
+    "url": "https://joomil-mcp.snowy-surf-deec.workers.dev/mcp"
   }
 }
 ```

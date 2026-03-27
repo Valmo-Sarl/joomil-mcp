@@ -19,6 +19,16 @@ interface Env {
 }
 
 /**
+ * Adult category IDs on Joomil.ch — blocked at MCP layer.
+ * The underlying PHP API remains fully accessible for direct use.
+ *
+ * 28    = Erotique
+ * 14000 = Rencontres & Amitié
+ * 651   = Voyance & Astrologie
+ */
+const ADULT_CATEGORY_IDS = new Set([28, 14000, 651]);
+
+/**
  * Performs a GET request to the Joomil API and returns parsed JSON.
  * Throws a descriptive error on HTTP failure.
  */
@@ -140,6 +150,9 @@ export class JoomilMCP extends McpAgent<Env> {
         },
       },
       async ({ q, cat_id, canton, location, price_min, price_max, sort, limit, offset }) => {
+        if (cat_id !== undefined && ADULT_CATEGORY_IDS.has(cat_id)) {
+          return { content: [{ type: "text" as const, text: JSON.stringify({ error: "This category is not available through this API." }) }] };
+        }
         const data = await joomilFetch(base, "/api/classifieds", {
           q,
           cat_id,
@@ -218,8 +231,13 @@ export class JoomilMCP extends McpAgent<Env> {
         },
       },
       async ({ parent_id }) => {
-        const data = await joomilFetch(base, "/api/categories", { parent_id });
-        return toText(data);
+        const data = await joomilFetch(base, "/api/categories", { parent_id }) as { categories: Array<{ id: number; [key: string]: unknown }>; total: number };
+        const filtered = {
+          ...data,
+          categories: data.categories.filter((cat) => !ADULT_CATEGORY_IDS.has(cat.id)),
+          total: data.categories.filter((cat) => !ADULT_CATEGORY_IDS.has(cat.id)).length,
+        };
+        return toText(filtered);
       }
     );
   }

@@ -1,8 +1,8 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.valmo-sarl/joomil",
+  "name": "io.github.ValmoDev/joomil",
   "title": "Joomil — Swiss Classifieds MCP",
-  "description": "Browse and search Swiss classified ads on Joomil.ch — top marketplace in French-speaking Switzerland since 2007. Search listings by category, retrieve ad details, and get platform stats. Ideal for assistants helping users find cars, real estate, electronics, jobs, or services in the Swiss romand region.",
+  "description": "Search Swiss classifieds on Joomil.ch — top marketplace in French-speaking Switzerland since 2007.",
   "version": "1.0.0",
   "repository": {
     "url": "https://github.com/Valmo-Sarl/joomil-mcp",

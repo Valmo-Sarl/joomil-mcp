@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "joomil": {
+      "type": "streamable-http",
+      "url": "https://joomil-mcp.snowy-surf-deec.workers.dev/mcp"
+    }
+  }
+}

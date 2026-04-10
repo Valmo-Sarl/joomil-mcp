@@ -2,3 +2,5 @@ node_modules/
 dist/
 .wrangler/
 worker-configuration.d.ts
+.mcpregistry_github_token
+.mcpregistry_registry_token

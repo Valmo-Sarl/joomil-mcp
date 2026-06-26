@@ -70,6 +70,16 @@ Add to your MCP settings:
 
 Returns a ready-to-use `filters` object for `search_classifieds`, plus a category confidence score and warnings when matching is uncertain.
 
+Useful examples:
+
+| User request | Typical suggested filters |
+|--------------|---------------------------|
+| `Tesla Model 3 moins de 25'000 CHF` | `q: "Tesla Model 3"`, `cat_id: 101`, `price_max: 25000`, `sort: "price_asc"` |
+| `appartement 3 pièces à Sion` | `q: "3 pièces"`, `cat_id: 10255`, `location: "Sion"` |
+| `Golf GTI dans le canton de Vaud` | `q: "Golf GTI"`, `cat_id: 101`, `canton: "Vaud"` |
+| `canapé vintage à Lausanne` | `q: "vintage"`, `cat_id: 10022`, `location: "Lausanne"` |
+| `iPhone 14 à Genève` | `q: "iPhone 14"`, `cat_id: 10127`, `location: "Genève"` |
+
 ```json
 {
   "query": "appartement 3 pièces à Sion",

@@ -6,9 +6,10 @@ Search and browse classified ads from [Joomil.ch](https://www.joomil.ch) — Swi
 
 | Tool | Description |
 |------|-------------|
-| `search_classifieds` | Search listings with filters: keyword, category, canton, location, price range, sort order, pagination |
+| `search_classifieds` | Search listings with filters: keyword, category, canton (strict enum), location, price range, sort order, pagination |
 | `get_classified` | Get full details of a listing by ID (description, images, vendor, expiry) |
 | `get_categories` | List active categories with hierarchy via parent_id |
+| `get_cantons` | List the canton values supported by the canton filter |
 
 ## Example Prompts
 
@@ -16,6 +17,7 @@ Search and browse classified ads from [Joomil.ch](https://www.joomil.ch) — Swi
 - "Show me apartments for rent in Vaud canton"
 - "What categories does Joomil have for electronics?"
 - "Find a vintage sofa in the Valais region"
+- "Which canton values can I use with the Joomil MCP?"
 
 ## Usage
 

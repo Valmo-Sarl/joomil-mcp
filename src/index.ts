@@ -6,11 +6,12 @@ import { z } from "zod";
  * Joomil MCP Server
  *
  * Exposes the Joomil.ch classifieds marketplace as MCP tools.
- * Four read-only tools:
+ * Five read-only tools:
  *   - search_classifieds : search listings with filters
  *   - get_classified     : get a single listing by ID
  *   - get_categories     : list categories (optionally by parent)
  *   - get_cantons        : list supported canton filter values
+ *   - suggest_filters    : infer search filters from a natural-language query
  *
  * Data source: Joomil public REST API (www.joomil.ch/api/*)
  */
@@ -124,6 +125,7 @@ const SUPPORTED_CANTONS: readonly CantonDef[] = [
 ] as const;
 
 const CANTON_NAMES = SUPPORTED_CANTONS.map((c) => c.name) as [string, ...string[]];
+const DEFAULT_SEARCH_LIMIT = 20;
 
 /**
  * Performs a GET request to the Joomil API and returns parsed JSON.
@@ -143,7 +145,7 @@ async function joomilFetch(
   }
 
   const response = await fetch(url.toString(), {
-    headers: { "User-Agent": "joomil-mcp/1.1" },
+    headers: { "User-Agent": "joomil-mcp/1.2" },
   });
 
   if (!response.ok) {
@@ -158,7 +160,7 @@ async function joomilFetch(
 /**
  * Wraps API data as MCP text content.
  */
-function toText(data: unknown): {
+function toText(data: unknown, summary?: string): {
   content: [{ type: "text"; text: string }];
   structuredContent?: Record<string, unknown>;
 } {
@@ -166,7 +168,7 @@ function toText(data: unknown): {
     content: [{ type: "text"; text: string }];
     structuredContent?: Record<string, unknown>;
   } = {
-    content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
+    content: [{ type: "text", text: summary ?? JSON.stringify(data, null, 2) }],
   };
 
   if (data !== null && typeof data === "object" && !Array.isArray(data)) {
@@ -263,6 +265,477 @@ const GetCantonsOutputSchema = {
   cantons: z.array(CantonOutputSchema),
   total: z.number(),
 };
+
+const SearchFiltersOutputSchema = z.object({
+  q: z.string().nullable(),
+  cat_id: z.number().nullable(),
+  canton: z.enum(CANTON_NAMES).nullable(),
+  location: z.string().nullable(),
+  price_min: z.number().nullable(),
+  price_max: z.number().nullable(),
+  sort: z.enum(["recent", "price_asc", "price_desc", "views"]),
+  limit: z.number(),
+});
+
+const SuggestedCategoryOutputSchema = z.object({
+  id: z.number(),
+  name: z.string(),
+  url: z.string(),
+  parent_id: z.number(),
+  confidence: z.number(),
+  reason: z.string(),
+}).nullable();
+
+const SuggestFiltersOutputSchema = {
+  query: z.string(),
+  filters: SearchFiltersOutputSchema,
+  category: SuggestedCategoryOutputSchema,
+  confidence: z.number(),
+  warnings: z.array(z.string()),
+  next_step: z.string(),
+};
+
+interface ApiCategory extends CategoryLike {
+  id: number;
+  name: string;
+  url: string;
+  parent_id: number;
+  ad_count?: number;
+  allow_ads?: boolean;
+}
+
+interface PriceExtraction {
+  price_min: number | null;
+  price_max: number | null;
+}
+
+interface CantonMatch {
+  canton: (typeof CANTON_NAMES)[number] | null;
+  matched: string | null;
+}
+
+interface CategorySuggestion {
+  category: ApiCategory;
+  confidence: number;
+  reason: string;
+  matchedTerms: string[];
+}
+
+const COMMON_LOCATIONS = [
+  "Genève",
+  "Lausanne",
+  "Sion",
+  "Fribourg",
+  "Neuchâtel",
+  "Yverdon",
+  "Yverdon-les-Bains",
+  "Montreux",
+  "Vevey",
+  "Nyon",
+  "Morges",
+  "Martigny",
+  "Monthey",
+  "Bulle",
+  "Renens",
+  "Bienne",
+  "Delémont",
+  "La Chaux-de-Fonds",
+  "Sierre",
+];
+
+const STOPWORDS = new Set([
+  "a", "au", "aux", "avec", "canton", "ch", "chez", "dans", "de", "des", "du", "en", "et",
+  "la", "le", "les", "me", "moi", "mon", "ma", "mes", "pour", "sur", "un",
+  "une", "romande", "romandie", "suisse", "the", "in", "on", "under", "with",
+]);
+
+const CATEGORY_REMOVE_TERMS = new Set([
+  "annonce", "annonces", "achat", "acheter", "appartement", "appartements",
+  "appart", "auto", "automobile", "automobiles", "camion", "canape",
+  "categorie", "emploi", "emplois", "immobilier", "job", "jobs", "location",
+  "louer", "maison", "maisons", "meuble", "meubles", "moto", "motos",
+  "scooter", "service", "services", "studio", "vente", "vendre", "vehicule",
+  "vehicules", "velo", "velos", "villa", "villas", "voiture", "voitures",
+]);
+
+function normalizeText(value: string): string {
+  return value
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[’`]/g, "'")
+    .toLowerCase()
+    .replace(/[^a-z0-9' -]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function stemToken(token: string): string {
+  if (token.length > 4 && token.endsWith("s")) {
+    return token.slice(0, -1);
+  }
+  return token;
+}
+
+function tokenize(value: string): string[] {
+  return normalizeText(value)
+    .split(" ")
+    .map(stemToken)
+    .filter((token) => token.length >= 2 && !STOPWORDS.has(token));
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function parseAmount(value: string): number | null {
+  let normalized = value.replace(/[\s'’]/g, "");
+  if (/^\d{1,3}([,.]\d{3})+$/.test(normalized)) {
+    normalized = normalized.replace(/[,.]/g, "");
+  } else if (/^\d+,\d{1,2}$/.test(normalized)) {
+    normalized = normalized.replace(",", ".");
+  } else {
+    normalized = normalized.replace(/,/g, "");
+  }
+  const amount = Number(normalized);
+  return Number.isFinite(amount) ? amount : null;
+}
+
+function extractPrices(query: string): PriceExtraction {
+  const maxPatterns = [
+    /(?:moins\s+de|moins\s+que|sous|max(?:imum)?|jusqu['’]?a|jusqu'a|jusqu’à|<=|<)\s*(\d[\d\s'’.,]*)/i,
+  ];
+  const minPatterns = [
+    /(?:plus\s+de|plus\s+que|min(?:imum)?|a\s+partir\s+de|à\s+partir\s+de|>=|>)\s*(\d[\d\s'’.,]*)/i,
+  ];
+  const price: PriceExtraction = { price_min: null, price_max: null };
+
+  for (const pattern of maxPatterns) {
+    const match = query.match(pattern);
+    if (match?.[1]) {
+      price.price_max = parseAmount(match[1]);
+      break;
+    }
+  }
+
+  for (const pattern of minPatterns) {
+    const match = query.match(pattern);
+    if (match?.[1]) {
+      price.price_min = parseAmount(match[1]);
+      break;
+    }
+  }
+
+  return price;
+}
+
+function removePricePhrases(query: string): string {
+  return query
+    .replace(/(?:moins\s+de|moins\s+que|sous|max(?:imum)?|jusqu['’]?a|jusqu'a|jusqu’à|<=|<)\s*\d[\d\s'’.,]*(?:\s*(?:chf|francs?))?/gi, " ")
+    .replace(/(?:plus\s+de|plus\s+que|min(?:imum)?|a\s+partir\s+de|à\s+partir\s+de|>=|>)\s*\d[\d\s'’.,]*(?:\s*(?:chf|francs?))?/gi, " ");
+}
+
+function cantonAliases(canton: CantonDef): string[] {
+  const aliases = [canton.name, canton.label_fr];
+  if (canton.code) aliases.push(canton.code);
+
+  if (canton.name === "Geneve") aliases.push("Genève", "Geneva");
+  if (canton.name === "Bern") aliases.push("Berne");
+  if (canton.name === "Bale-Ville") aliases.push("Bâle-Ville", "Bale Ville", "Bâle Ville", "Basel");
+  if (canton.name === "Etranger") aliases.push("Étranger", "Hors Suisse");
+
+  return aliases;
+}
+
+function findCanton(query: string): CantonMatch {
+  const normalizedQuery = normalizeText(query);
+  const queryTokens = new Set(tokenize(query));
+
+  for (const canton of SUPPORTED_CANTONS) {
+    const aliases = cantonAliases(canton).sort((a, b) => b.length - a.length);
+    for (const alias of aliases) {
+      const normalizedAlias = normalizeText(alias);
+      if (!normalizedAlias) continue;
+
+      if (normalizedAlias.length <= 2) {
+        if (queryTokens.has(normalizedAlias)) {
+          return { canton: canton.name, matched: alias };
+        }
+      } else if (normalizedQuery.includes(normalizedAlias)) {
+        return { canton: canton.name, matched: alias };
+      }
+    }
+  }
+
+  return { canton: null, matched: null };
+}
+
+function findLocation(query: string, canton: CantonMatch): string | null {
+  const normalizedQuery = normalizeText(query);
+
+  for (const location of COMMON_LOCATIONS) {
+    const normalizedLocation = normalizeText(location);
+    const isCantonPhrase =
+      normalizedQuery.includes(`canton de ${normalizedLocation}`) ||
+      normalizedQuery.includes(`canton ${normalizedLocation}`);
+
+    if (!isCantonPhrase && normalizedQuery.includes(normalizedLocation)) {
+      return location;
+    }
+  }
+
+  const postalCode = query.match(/\b\d{4}\b/);
+  if (postalCode?.[0]) return postalCode[0];
+
+  const genericMatch = query.match(/\b(?:à|a|sur|in|près de|pres de|proche de)\s+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ' -]{1,40}|\d{4,5})/i);
+  if (!genericMatch?.[1]) return null;
+
+  const candidate = genericMatch[1]
+    .split(/\s+(?:dans|canton|moins|sous|avec|pour|max|min|chf|francs?|tri|sort)\b/i)[0]
+    .trim();
+  const normalizedCandidate = normalizeText(candidate);
+  const excluded = new Set(["moins", "vendre", "louer", "partir"]);
+
+  if (
+    !candidate ||
+    excluded.has(normalizedCandidate) ||
+    normalizedCandidate.split(" ").length > 3 ||
+    (canton.matched && normalizedCandidate === normalizeText(canton.matched))
+  ) {
+    return null;
+  }
+
+  return candidate;
+}
+
+function removeCantonPhrase(query: string, canton: CantonMatch): string {
+  if (!canton.matched) return query;
+  const alias = escapeRegExp(canton.matched);
+  return query
+    .replace(new RegExp(`\\b(?:dans\\s+le\\s+)?canton\\s+(?:de\\s+)?${alias}\\b`, "gi"), " ")
+    .replace(new RegExp(`\\b${alias}\\b`, "gi"), " ");
+}
+
+function removeLocationPhrase(query: string, location: string | null): string {
+  if (!location) return query;
+  const escaped = escapeRegExp(location);
+  return query
+    .replace(new RegExp(`\\b(?:à|a|sur|in|près\\s+de|pres\\s+de|proche\\s+de)\\s+${escaped}\\b`, "gi"), " ")
+    .replace(new RegExp(`\\b${escaped}\\b`, "gi"), " ");
+}
+
+function includesAll(value: string, required: string[]): boolean {
+  return required.every((part) => value.includes(part));
+}
+
+function categoryHintScore(category: ApiCategory, normalizedQuery: string, queryTokens: Set<string>) {
+  const normalizedUrl = normalizeText(category.url);
+  const hints: Array<{ terms: string[]; urlParts: string[]; score: number; reason: string }> = [
+    { terms: ["appartement", "appart", "studio", "logement"], urlParts: ["immobilier", "appartements"], score: 24, reason: "requête immobilière appartement" },
+    { terms: ["maison", "villa"], urlParts: ["immobilier", "maisons-villas"], score: 24, reason: "requête immobilière maison" },
+    { terms: ["terrain", "parcelle"], urlParts: ["immobilier", "terrains"], score: 22, reason: "requête immobilière terrain" },
+    { terms: ["voiture", "auto", "automobile", "vehicule", "golf", "tesla", "bmw", "audi", "mercedes", "renault", "peugeot", "toyota"], urlParts: ["automobiles", "voitures-de-tourisme"], score: 24, reason: "requête automobile" },
+    { terms: ["moto", "scooter"], urlParts: ["motos-deux-roues"], score: 20, reason: "requête moto/deux-roues" },
+    { terms: ["emploi", "job", "travail", "poste"], urlParts: ["emplois-services"], score: 18, reason: "requête emploi/service" },
+    { terms: ["canape", "sofa", "fauteuil", "table", "chaise", "lit", "armoire", "meuble"], urlParts: ["mobilier-decoration"], score: 20, reason: "requête mobilier" },
+    { terms: ["iphone", "telephone", "smartphone", "natel"], urlParts: ["telephonie-natels"], score: 20, reason: "requête téléphonie" },
+    { terms: ["ordinateur", "pc", "macbook", "imac", "laptop"], urlParts: ["informatique"], score: 18, reason: "requête informatique" },
+    { terms: ["velo", "vtt", "bike"], urlParts: ["sport-loisirs"], score: 14, reason: "requête sport/vélo" },
+  ];
+
+  for (const hint of hints) {
+    const matched = hint.terms.filter((term) => normalizedQuery.includes(term) || queryTokens.has(stemToken(term)));
+    if (matched.length > 0 && includesAll(normalizedUrl, hint.urlParts)) {
+      return { score: hint.score + matched.length * 2, reason: hint.reason, terms: matched };
+    }
+  }
+
+  return { score: 0, reason: "", terms: [] };
+}
+
+function scoreCategory(category: ApiCategory, query: string): CategorySuggestion | null {
+  const normalizedQuery = normalizeText(query);
+  const queryTokens = new Set(tokenize(query));
+  const categoryTokens = new Set(tokenize(`${category.name} ${category.url}`));
+  const matchedTerms: string[] = [];
+  let score = 0;
+  let reason = "";
+
+  for (const token of queryTokens) {
+    if (categoryTokens.has(token)) {
+      matchedTerms.push(token);
+      score += 4;
+    }
+  }
+
+  const hint = categoryHintScore(category, normalizedQuery, queryTokens);
+  if (hint.score > 0) {
+    score += hint.score;
+    reason = hint.reason;
+    matchedTerms.push(...hint.terms);
+  }
+
+  if (normalizedQuery.match(/\b(location|louer|loyer)\b/) && category.url.includes("/locations/")) score += 8;
+  if (normalizedQuery.match(/\b(vente|vendre|acheter|achat)\b/) && category.url.includes("/ventes/")) score += 8;
+  if (category.url.includes("cherche-a-")) score -= 6;
+  if (category.allow_ads) score += 1;
+  if (category.ad_count) score += Math.min(4, Math.log10(category.ad_count + 1));
+
+  if (score < 8) return null;
+
+  const confidence = Math.min(0.95, Math.max(0.45, score / 40));
+  return {
+    category,
+    confidence: Number(confidence.toFixed(2)),
+    reason: reason || `mots-clés proches de "${category.name}"`,
+    matchedTerms: Array.from(new Set(matchedTerms)),
+  };
+}
+
+function suggestCategory(categories: ApiCategory[], query: string): CategorySuggestion | null {
+  const suggestions = categories
+    .filter((category) => !isRestrictedCategory(category))
+    .map((category) => scoreCategory(category, query))
+    .filter((suggestion): suggestion is CategorySuggestion => suggestion !== null)
+    .sort((a, b) => {
+      if (b.confidence !== a.confidence) return b.confidence - a.confidence;
+      return (b.category.ad_count ?? 0) - (a.category.ad_count ?? 0);
+    });
+
+  return suggestions[0] ?? null;
+}
+
+function buildCleanQuery(
+  query: string,
+  canton: CantonMatch,
+  location: string | null,
+  category: CategorySuggestion | null
+): string | null {
+  let cleaned = removePricePhrases(query);
+  cleaned = removeCantonPhrase(cleaned, canton);
+  cleaned = removeLocationPhrase(cleaned, location);
+
+  const removableTerms = new Set(CATEGORY_REMOVE_TERMS);
+  for (const term of category?.matchedTerms ?? []) {
+    if (CATEGORY_REMOVE_TERMS.has(term)) removableTerms.add(term);
+  }
+
+  const remaining = cleaned
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter(Boolean)
+    .filter((token) => {
+      const normalized = stemToken(normalizeText(token));
+      return normalized && !removableTerms.has(normalized) && !STOPWORDS.has(normalized);
+    })
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return remaining || null;
+}
+
+function buildFilterSuggestion(query: string, categories: ApiCategory[]) {
+  const prices = extractPrices(query);
+  const canton = findCanton(query);
+  const location = findLocation(query, canton);
+  const category = suggestCategory(categories, query);
+  const q = buildCleanQuery(query, canton, location, category);
+  const sort = prices.price_max !== null ? "price_asc" : "recent";
+  const warnings: string[] = [];
+
+  if (!category) {
+    warnings.push("No confident category match. Use get_categories if category precision matters.");
+  }
+
+  if (!q && !category && !location && !canton.canton) {
+    warnings.push("The query is broad. Search will browse recent listings unless you add filters.");
+  }
+
+  const confidenceSignals = [
+    category?.confidence,
+    canton.canton ? 0.9 : undefined,
+    location ? 0.75 : undefined,
+    prices.price_min !== null || prices.price_max !== null ? 0.85 : undefined,
+    q ? 0.65 : undefined,
+  ].filter((value): value is number => value !== undefined);
+  const confidence = confidenceSignals.length > 0
+    ? confidenceSignals.reduce((sum, value) => sum + value, 0) / confidenceSignals.length
+    : 0.35;
+
+  const filters = {
+    q,
+    cat_id: category?.category.id ?? null,
+    canton: canton.canton,
+    location,
+    price_min: prices.price_min,
+    price_max: prices.price_max,
+    sort,
+    limit: DEFAULT_SEARCH_LIMIT,
+  };
+
+  return {
+    query,
+    filters,
+    category: category
+      ? {
+          id: category.category.id,
+          name: category.category.name,
+          url: category.category.url,
+          parent_id: category.category.parent_id,
+          confidence: category.confidence,
+          reason: category.reason,
+        }
+      : null,
+    confidence: Number(confidence.toFixed(2)),
+    warnings,
+    next_step: "Call search_classifieds with the filters object. Adjust q or cat_id if the result set is too broad.",
+  };
+}
+
+function summarizeSuggestion(result: ReturnType<typeof buildFilterSuggestion>): string {
+  const parts = [
+    result.filters.cat_id !== null ? `cat_id=${result.filters.cat_id}` : null,
+    result.filters.q ? `q="${result.filters.q}"` : null,
+    result.filters.location ? `location="${result.filters.location}"` : null,
+    result.filters.canton ? `canton=${result.filters.canton}` : null,
+    result.filters.price_min !== null ? `price_min=${result.filters.price_min}` : null,
+    result.filters.price_max !== null ? `price_max=${result.filters.price_max}` : null,
+    `sort=${result.filters.sort}`,
+  ].filter(Boolean);
+
+  const warning = result.warnings.length > 0 ? ` ${result.warnings.join(" ")}` : "";
+  return `Filtres suggérés pour "${result.query}": ${parts.join(", ")}. Confiance ${result.confidence}.${warning}`;
+}
+
+function summarizeSearchResult(result: ReturnType<typeof projectSearchResult>): string {
+  const count = result.results.length;
+  const filtered = result.filtered_out > 0 ? ` ${result.filtered_out} annonce(s) filtrée(s) par restrictions MCP.` : "";
+  const next = result.has_more && result.next_offset !== null
+    ? ` Utilise offset=${result.next_offset} pour la suite.`
+    : "";
+  return `${count} annonce(s) retournée(s) sur ${result.total}.${filtered}${next}`;
+}
+
+function summarizeClassified(result: ReturnType<typeof projectClassified>): string {
+  if (result === null || typeof result !== "object" || !("title" in result)) {
+    return "Détail d'annonce retourné.";
+  }
+
+  const ad = result as { title?: string; price?: { amount?: number | null; currency?: string }; location?: { city?: string | null } };
+  const price = ad.price?.amount !== null && ad.price?.amount !== undefined
+    ? `${ad.price.amount} ${ad.price.currency ?? "CHF"}`
+    : "prix sur demande";
+  const location = ad.location?.city ? ` à ${ad.location.city}` : "";
+  return `${ad.title ?? "Annonce"}: ${price}${location}.`;
+}
+
+function summarizeCategories(total: number): string {
+  return `${total} catégorie(s) retournée(s).`;
+}
+
+function summarizeCantons(total: number): string {
+  return `${total} valeur(s) de canton disponibles. Utilise le champ name avec search_classifieds.`;
+}
 
 /**
  * Projection d'une annonce (niveau liste / search).
@@ -391,11 +864,42 @@ function projectClassified(data: unknown) {
 export class JoomilMCP extends McpAgent<Env> {
   server = new McpServer({
     name: "joomil-mcp",
-    version: "1.1.0",
+    version: "1.2.0",
   });
 
   async init(): Promise<void> {
     const base = this.env.JOOMIL_API_BASE ?? "https://www.joomil.ch";
+
+    // ============================================================================
+    // Tool : suggest_filters
+    // ============================================================================
+
+    this.server.registerTool(
+      "suggest_filters",
+      {
+        description:
+          "Infer search_classifieds filters from a natural-language query. " +
+          "Use this before search_classifieds when the user mentions a category, location, canton or price in free text. " +
+          "Returns a ready-to-use filters object, a category confidence score and warnings for uncertain matches.",
+        annotations: {
+          title: "Suggest Filters",
+          readOnlyHint: true,
+          destructiveHint: false,
+        },
+        inputSchema: {
+          query: z
+            .string()
+            .min(1)
+            .describe("Natural-language search request, e.g. 'appartement 3 pièces à Sion' or 'Tesla Model 3 moins de 25000 CHF'."),
+        },
+        outputSchema: SuggestFiltersOutputSchema,
+      },
+      async ({ query }) => {
+        const data = await joomilFetch(base, "/api/categories") as { categories: ApiCategory[]; total: number };
+        const suggestion = buildFilterSuggestion(query, data.categories);
+        return toText(suggestion, summarizeSuggestion(suggestion));
+      }
+    );
 
     // ============================================================================
     // Tool : search_classifieds
@@ -488,7 +992,8 @@ export class JoomilMCP extends McpAgent<Env> {
           limit,
           offset,
         });
-        return toText(projectSearchResult(data));
+        const result = projectSearchResult(data);
+        return toText(result, summarizeSearchResult(result));
       }
     );
 
@@ -526,7 +1031,8 @@ export class JoomilMCP extends McpAgent<Env> {
         if (isRestrictedCategory(ad?.category)) {
           return restrictedCategoryError();
         }
-        return toText(projectClassified(data));
+        const result = projectClassified(data);
+        return toText(result, summarizeClassified(result));
       }
     );
 
@@ -562,7 +1068,7 @@ export class JoomilMCP extends McpAgent<Env> {
       },
       async ({ parent_id }) => {
         if (parent_id !== undefined && isRestrictedCategory({ id: parent_id })) {
-          return toText({ categories: [], total: 0 });
+          return toText({ categories: [], total: 0 }, summarizeCategories(0));
         }
         const data = await joomilFetch(base, "/api/categories", { parent_id }) as { categories: Array<{ id: number; [key: string]: unknown }>; total: number };
         const categories = data.categories.filter((cat) => !isRestrictedCategory(cat));
@@ -571,7 +1077,7 @@ export class JoomilMCP extends McpAgent<Env> {
           categories,
           total: categories.length,
         };
-        return toText(filtered);
+        return toText(filtered, summarizeCategories(filtered.total));
       }
     );
 
@@ -602,7 +1108,8 @@ export class JoomilMCP extends McpAgent<Env> {
         outputSchema: GetCantonsOutputSchema,
       },
       async () => {
-        return toText({ cantons: SUPPORTED_CANTONS, total: SUPPORTED_CANTONS.length });
+        const result = { cantons: SUPPORTED_CANTONS, total: SUPPORTED_CANTONS.length };
+        return toText(result, summarizeCantons(result.total));
       }
     );
   }

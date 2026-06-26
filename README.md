@@ -8,6 +8,7 @@ Browse and search 45,000+ active listings across 34 categories: real estate, veh
 
 | Tool | Description |
 |------|-------------|
+| `suggest_filters` | Infer `search_classifieds` filters from a natural-language query |
 | `search_classifieds` | Search listings with filters: keyword, category, canton (strict enum), location, price range, sort, pagination |
 | `get_classified` | Get full details of a listing by ID: description, images, vendor, expiry date |
 | `get_categories` | List active categories with hierarchy via `parent_id` |
@@ -56,8 +57,45 @@ Add to your MCP settings:
 
 > **Tip for agents**: call `get_cantons` before filtering by canton — the API uses
 > non-obvious spellings (e.g. `Bern` not `Berne`, `Geneve` not `Genève`/`Geneva`).
+> For free-text user requests, call `suggest_filters` first, then pass the returned
+> `filters` object to `search_classifieds`.
 
 ## API Reference
+
+### `suggest_filters`
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `query` | string | Natural-language search request, e.g. `appartement 3 pièces à Sion` |
+
+Returns a ready-to-use `filters` object for `search_classifieds`, plus a category confidence score and warnings when matching is uncertain.
+
+```json
+{
+  "query": "appartement 3 pièces à Sion",
+  "filters": {
+    "q": "3 pièces",
+    "cat_id": 10255,
+    "canton": null,
+    "location": "Sion",
+    "price_min": null,
+    "price_max": null,
+    "sort": "recent",
+    "limit": 20
+  },
+  "category": {
+    "id": 10255,
+    "name": "Appartements",
+    "url": "https://www.joomil.ch/annonces/immobilier/locations/appartements/10255",
+    "parent_id": 339,
+    "confidence": 0.82,
+    "reason": "requête immobilière appartement"
+  },
+  "confidence": 0.74,
+  "warnings": [],
+  "next_step": "Call search_classifieds with the filters object. Adjust q or cat_id if the result set is too broad."
+}
+```
 
 ### `search_classifieds`
 
@@ -73,7 +111,7 @@ Add to your MCP settings:
 | `limit` | number | Results per page (1–50, default 20) |
 | `offset` | number | Pagination offset — use `next_offset` from previous response |
 
-The response wrapper includes `results`, `total`, `limit`, `offset`, `has_more`, `next_offset`, and `filtered_out` (items removed from the current page by MCP-side category restrictions).
+The response text is a short human-readable summary. Full data is also returned in `structuredContent` with `results`, `total`, `limit`, `offset`, `has_more`, `next_offset`, and `filtered_out` (items removed from the current page by MCP-side category restrictions).
 
 **Result shape** (each item):
 ```json

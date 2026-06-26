@@ -68,14 +68,16 @@ Add to your MCP settings:
 |-----------|------|-------------|
 | `query` | string | Natural-language search request, e.g. `appartement 3 pièces à Sion` |
 
-Returns a ready-to-use `filters` object for `search_classifieds`, plus a category confidence score and warnings when matching is uncertain.
+Returns a ready-to-use `filters` object for `search_classifieds`, plus a category confidence score and warnings when matching is uncertain. Category metadata is cached briefly by the MCP layer to avoid refetching the category tree for every suggestion.
 
 Useful examples:
 
 | User request | Typical suggested filters |
 |--------------|---------------------------|
 | `Tesla Model 3 moins de 25'000 CHF` | `q: "Tesla Model 3"`, `cat_id: 101`, `price_max: 25000`, `sort: "price_asc"` |
+| `vélo budget 1.5k CHF` | `q: null`, category in sport/leisure, `price_max: 1500`, `sort: "price_asc"` |
 | `appartement 3 pièces à Sion` | `q: "3 pièces"`, `cat_id: 10255`, `location: "Sion"` |
+| `voiture entre 10'000 et 20'000 CHF` | `cat_id: 101`, `price_min: 10000`, `price_max: 20000` |
 | `Golf GTI dans le canton de Vaud` | `q: "Golf GTI"`, `cat_id: 101`, `canton: "Vaud"` |
 | `canapé vintage à Lausanne` | `q: "vintage"`, `cat_id: 10022`, `location: "Lausanne"` |
 | `iPhone 14 à Genève` | `q: "iPhone 14"`, `cat_id: 10127`, `location: "Genève"` |
@@ -121,7 +123,7 @@ Useful examples:
 | `limit` | number | Results per page (1–50, default 20) |
 | `offset` | number | Pagination offset — use `next_offset` from previous response |
 
-The response text is a short human-readable summary. Full data is also returned in `structuredContent` with `results`, `total`, `limit`, `offset`, `has_more`, `next_offset`, and `filtered_out` (items removed from the current page by MCP-side category restrictions).
+Tool responses include a short human-readable summary followed by compact serialized JSON in `content` for MCP backward compatibility. Full data is also returned in `structuredContent` with `results`, `total`, `limit`, `offset`, `has_more`, `next_offset`, and `filtered_out` (items removed from the current page by MCP-side category restrictions).
 
 **Result shape** (each item):
 ```json
@@ -187,6 +189,7 @@ This MCP server is **read-only** and uses **public data only**.
 - **Restricted categories**: Erotique (28), Rencontres & Amitié (14000), Voyance & Astrologie (651), and their descendants are filtered out by the MCP layer per content policy. The underlying PHP API remains available for direct use.
 - **Canton filter is strict**: only the values returned by `get_cantons` are accepted. Other spellings (`Berne`, `Genève`, `Geneva`, `GE`, `VD`...) are silently ignored by the upstream API and would return all listings instead of a filtered set — the strict enum here prevents that.
 - **Currency**: all prices are in CHF. Listings may have `price.amount: null` (price on request) or `0` (free).
+- **Upstream errors**: Joomil API failures are returned as MCP tool errors with `isError: true`.
 
 ## Deploy Your Own
 

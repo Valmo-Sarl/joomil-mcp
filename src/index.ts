@@ -79,15 +79,7 @@ function isRestrictedCategory(category: CategoryLike | null | undefined): boolea
 }
 
 function restrictedCategoryError() {
-  return {
-    content: [
-      {
-        type: "text" as const,
-        text: JSON.stringify({ error: "This category is not available through this API." }),
-      },
-    ],
-    isError: true,
-  };
+  return toError({ error: "This category is not available through this API." });
 }
 
 /**
@@ -126,6 +118,17 @@ const SUPPORTED_CANTONS: readonly CantonDef[] = [
 
 const CANTON_NAMES = SUPPORTED_CANTONS.map((c) => c.name) as [string, ...string[]];
 const DEFAULT_SEARCH_LIMIT = 20;
+const CATEGORY_CACHE_TTL_MS = 10 * 60 * 1000;
+
+class JoomilApiError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly statusText: string,
+    public readonly url: string
+  ) {
+    super(`Joomil API error ${status}: ${statusText}`);
+  }
+}
 
 /**
  * Performs a GET request to the Joomil API and returns parsed JSON.
@@ -145,30 +148,57 @@ async function joomilFetch(
   }
 
   const response = await fetch(url.toString(), {
-    headers: { "User-Agent": "joomil-mcp/1.2" },
+    headers: { "User-Agent": "joomil-mcp/1.2.1" },
   });
 
   if (!response.ok) {
-    throw new Error(
-      `Joomil API error ${response.status}: ${response.statusText} — ${url.toString()}`
-    );
+    throw new JoomilApiError(response.status, response.statusText, url.toString());
   }
 
   return response.json();
+}
+
+function toError(data: Record<string, unknown>) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(data) }],
+    isError: true,
+  };
+}
+
+function toToolError(error: unknown) {
+  if (error instanceof JoomilApiError) {
+    return toError({
+      error: "Joomil API request failed",
+      status: error.status,
+      status_text: error.statusText,
+      url: error.url,
+    });
+  }
+
+  return toError({
+    error: "Unexpected MCP error",
+    message: error instanceof Error ? error.message : String(error),
+  });
 }
 
 /**
  * Wraps API data as MCP text content.
  */
 function toText(data: unknown, summary?: string): {
-  content: [{ type: "text"; text: string }];
+  content: Array<{ type: "text"; text: string }>;
   structuredContent?: Record<string, unknown>;
 } {
+  const serialized = JSON.stringify(data) ?? String(data);
   const result: {
-    content: [{ type: "text"; text: string }];
+    content: Array<{ type: "text"; text: string }>;
     structuredContent?: Record<string, unknown>;
   } = {
-    content: [{ type: "text", text: summary ?? JSON.stringify(data, null, 2) }],
+    content: summary
+      ? [
+          { type: "text", text: summary },
+          { type: "text", text: serialized },
+        ]
+      : [{ type: "text", text: serialized }],
   };
 
   if (data !== null && typeof data === "object" && !Array.isArray(data)) {
@@ -304,6 +334,27 @@ interface ApiCategory extends CategoryLike {
   allow_ads?: boolean;
 }
 
+let categoryCache: {
+  baseUrl: string;
+  expiresAt: number;
+  categories: ApiCategory[];
+} | null = null;
+
+async function getCachedCategories(baseUrl: string): Promise<ApiCategory[]> {
+  const now = Date.now();
+  if (categoryCache && categoryCache.baseUrl === baseUrl && categoryCache.expiresAt > now) {
+    return categoryCache.categories;
+  }
+
+  const data = await joomilFetch(baseUrl, "/api/categories") as { categories: ApiCategory[] };
+  categoryCache = {
+    baseUrl,
+    expiresAt: now + CATEGORY_CACHE_TTL_MS,
+    categories: data.categories,
+  };
+  return data.categories;
+}
+
 interface PriceExtraction {
   price_min: number | null;
   price_max: number | null;
@@ -344,7 +395,8 @@ const COMMON_LOCATIONS = [
 ];
 
 const STOPWORDS = new Set([
-  "a", "au", "aux", "avec", "canton", "ch", "chez", "dans", "de", "des", "du", "en", "et",
+  "a", "au", "aux", "avec", "budget", "canton", "ch", "chf", "chez", "dans", "de", "des", "du", "en", "et",
+  "franc", "francs",
   "la", "le", "les", "me", "moi", "mon", "ma", "mes", "pour", "sur", "un",
   "une", "romande", "romandie", "suisse", "the", "in", "on", "under", "with",
 ]);
@@ -400,38 +452,94 @@ function parseAmount(value: string): number | null {
   return Number.isFinite(amount) ? amount : null;
 }
 
+const AMOUNT_PATTERN = String.raw`(?:CHF\s*)?(\d+(?:[\s'’.,]\d{3})*(?:[,.]\d{1,2})?|\d+(?:[,.]\d+)?)(?:\s*([kK]))?(?:\s*(?:CHF|francs?))?`;
+
+function amountFromCaptures(amountText: string | undefined, suffix: string | undefined): number | null {
+  if (!amountText) return null;
+  const amount = parseAmount(amountText);
+  if (amount === null) return null;
+  return suffix?.toLowerCase() === "k" ? amount * 1000 : amount;
+}
+
 function extractPrices(query: string): PriceExtraction {
-  const maxPatterns = [
-    /(?:moins\s+de|moins\s+que|sous|max(?:imum)?|jusqu['’]?a|jusqu'a|jusqu’à|<=|<)\s*(\d[\d\s'’.,]*)/i,
-  ];
-  const minPatterns = [
-    /(?:plus\s+de|plus\s+que|min(?:imum)?|a\s+partir\s+de|à\s+partir\s+de|>=|>)\s*(\d[\d\s'’.,]*)/i,
-  ];
+  const betweenPattern = new RegExp(
+    String.raw`(?:entre|between)\s+${AMOUNT_PATTERN}\s+(?:et|and|a|à|-|–|—)\s+${AMOUNT_PATTERN}`,
+    "i"
+  );
+  const rangePattern = new RegExp(String.raw`\b${AMOUNT_PATTERN}\s*(?:-|–|—)\s*${AMOUNT_PATTERN}\b`, "i");
+  const maxPattern = new RegExp(
+    String.raw`(?:moins\s+de|moins\s+que|sous|budget(?:\s+de)?|max(?:imum)?|jusqu['’]?a|jusqu'a|jusqu’à|<=|<)\s*${AMOUNT_PATTERN}`,
+    "i"
+  );
+  const minPattern = new RegExp(
+    String.raw`(?:plus\s+de|plus\s+que|min(?:imum)?|dès|des|from|a\s+partir\s+de|à\s+partir\s+de|>=|>)\s*${AMOUNT_PATTERN}`,
+    "i"
+  );
+  const prefixedCurrencyPattern = /\bCHF\s*(\d+(?:[\s'’.,]\d{3})*(?:[,.]\d{1,2})?|\d+(?:[,.]\d+)?)(?:\s*([kK]))?\b/i;
+  const suffixedCurrencyPattern = /\b(\d+(?:[\s'’.,]\d{3})*(?:[,.]\d{1,2})?|\d+(?:[,.]\d+)?)(?:\s*([kK]))?\s*(?:CHF|francs?)\b/i;
+  const standaloneKPattern = /\b(\d+(?:[,.]\d+)?)\s*k\b/i;
   const price: PriceExtraction = { price_min: null, price_max: null };
 
-  for (const pattern of maxPatterns) {
-    const match = query.match(pattern);
-    if (match?.[1]) {
-      price.price_max = parseAmount(match[1]);
-      break;
-    }
+  const betweenMatch = query.match(betweenPattern);
+  if (betweenMatch) {
+    price.price_min = amountFromCaptures(betweenMatch[1], betweenMatch[2]);
+    price.price_max = amountFromCaptures(betweenMatch[3], betweenMatch[4]);
+    return price;
   }
 
-  for (const pattern of minPatterns) {
-    const match = query.match(pattern);
-    if (match?.[1]) {
-      price.price_min = parseAmount(match[1]);
-      break;
-    }
+  const rangeMatch = query.match(rangePattern);
+  if (rangeMatch) {
+    price.price_min = amountFromCaptures(rangeMatch[1], rangeMatch[2]);
+    price.price_max = amountFromCaptures(rangeMatch[3], rangeMatch[4]);
+    return price;
+  }
+
+  const maxMatch = query.match(maxPattern);
+  if (maxMatch) {
+    price.price_max = amountFromCaptures(maxMatch[1], maxMatch[2]);
+  }
+
+  const minMatch = query.match(minPattern);
+  if (minMatch) {
+    price.price_min = amountFromCaptures(minMatch[1], minMatch[2]);
+  }
+
+  if (price.price_min === null && price.price_max === null) {
+    const currencyMatch = query.match(prefixedCurrencyPattern) ?? query.match(suffixedCurrencyPattern);
+    const kMatch = query.match(standaloneKPattern);
+    if (currencyMatch) price.price_max = amountFromCaptures(currencyMatch[1], currencyMatch[2]);
+    else if (kMatch) price.price_max = amountFromCaptures(kMatch[1], "k");
   }
 
   return price;
 }
 
 function removePricePhrases(query: string): string {
+  const betweenPattern = new RegExp(
+    String.raw`(?:entre|between)\s+${AMOUNT_PATTERN}\s+(?:et|and|a|à|-|–|—)\s+${AMOUNT_PATTERN}`,
+    "gi"
+  );
+  const rangePattern = new RegExp(String.raw`\b${AMOUNT_PATTERN}\s*(?:-|–|—)\s*${AMOUNT_PATTERN}\b`, "gi");
+  const maxPattern = new RegExp(
+    String.raw`(?:moins\s+de|moins\s+que|sous|budget(?:\s+de)?|max(?:imum)?|jusqu['’]?a|jusqu'a|jusqu’à|<=|<)\s*${AMOUNT_PATTERN}`,
+    "gi"
+  );
+  const minPattern = new RegExp(
+    String.raw`(?:plus\s+de|plus\s+que|min(?:imum)?|dès|des|from|a\s+partir\s+de|à\s+partir\s+de|>=|>)\s*${AMOUNT_PATTERN}`,
+    "gi"
+  );
+  const prefixedCurrencyPattern = /\bCHF\s*\d+(?:[\s'’.,]\d{3})*(?:[,.]\d{1,2})?(?:\s*[kK])?\b/gi;
+  const suffixedCurrencyPattern = /\b\d+(?:[\s'’.,]\d{3})*(?:[,.]\d{1,2})?(?:\s*[kK])?\s*(?:CHF|francs?)\b/gi;
+  const standaloneKPattern = /\b\d+(?:[,.]\d+)?\s*k\b/gi;
+
   return query
-    .replace(/(?:moins\s+de|moins\s+que|sous|max(?:imum)?|jusqu['’]?a|jusqu'a|jusqu’à|<=|<)\s*\d[\d\s'’.,]*(?:\s*(?:chf|francs?))?/gi, " ")
-    .replace(/(?:plus\s+de|plus\s+que|min(?:imum)?|a\s+partir\s+de|à\s+partir\s+de|>=|>)\s*\d[\d\s'’.,]*(?:\s*(?:chf|francs?))?/gi, " ");
+    .replace(betweenPattern, " ")
+    .replace(rangePattern, " ")
+    .replace(maxPattern, " ")
+    .replace(minPattern, " ")
+    .replace(prefixedCurrencyPattern, " ")
+    .replace(suffixedCurrencyPattern, " ")
+    .replace(standaloneKPattern, " ");
 }
 
 function cantonAliases(canton: CantonDef): string[] {
@@ -864,7 +972,7 @@ function projectClassified(data: unknown) {
 export class JoomilMCP extends McpAgent<Env> {
   server = new McpServer({
     name: "joomil-mcp",
-    version: "1.2.0",
+    version: "1.2.1",
   });
 
   async init(): Promise<void> {
@@ -895,9 +1003,13 @@ export class JoomilMCP extends McpAgent<Env> {
         outputSchema: SuggestFiltersOutputSchema,
       },
       async ({ query }) => {
-        const data = await joomilFetch(base, "/api/categories") as { categories: ApiCategory[]; total: number };
-        const suggestion = buildFilterSuggestion(query, data.categories);
-        return toText(suggestion, summarizeSuggestion(suggestion));
+        try {
+          const categories = await getCachedCategories(base);
+          const suggestion = buildFilterSuggestion(query, categories);
+          return toText(suggestion, summarizeSuggestion(suggestion));
+        } catch (error) {
+          return toToolError(error);
+        }
       }
     );
 
@@ -978,22 +1090,26 @@ export class JoomilMCP extends McpAgent<Env> {
         outputSchema: SearchClassifiedsOutputSchema,
       },
       async ({ q, cat_id, canton, location, price_min, price_max, sort, limit, offset }) => {
-        if (cat_id !== undefined && isRestrictedCategory({ id: cat_id })) {
-          return restrictedCategoryError();
+        try {
+          if (cat_id !== undefined && isRestrictedCategory({ id: cat_id })) {
+            return restrictedCategoryError();
+          }
+          const data = await joomilFetch(base, "/api/classifieds", {
+            q,
+            cat_id,
+            canton,
+            location,
+            price_min,
+            price_max,
+            sort,
+            limit,
+            offset,
+          });
+          const result = projectSearchResult(data);
+          return toText(result, summarizeSearchResult(result));
+        } catch (error) {
+          return toToolError(error);
         }
-        const data = await joomilFetch(base, "/api/classifieds", {
-          q,
-          cat_id,
-          canton,
-          location,
-          price_min,
-          price_max,
-          sort,
-          limit,
-          offset,
-        });
-        const result = projectSearchResult(data);
-        return toText(result, summarizeSearchResult(result));
       }
     );
 
@@ -1026,13 +1142,17 @@ export class JoomilMCP extends McpAgent<Env> {
         outputSchema: GetClassifiedOutputSchema,
       },
       async ({ id }) => {
-        const data = await joomilFetch(base, `/api/classifieds/${id}`);
-        const ad = (data as { ad?: DetailAd }).ad;
-        if (isRestrictedCategory(ad?.category)) {
-          return restrictedCategoryError();
+        try {
+          const data = await joomilFetch(base, `/api/classifieds/${id}`);
+          const ad = (data as { ad?: DetailAd }).ad;
+          if (isRestrictedCategory(ad?.category)) {
+            return restrictedCategoryError();
+          }
+          const result = projectClassified(data);
+          return toText(result, summarizeClassified(result));
+        } catch (error) {
+          return toToolError(error);
         }
-        const result = projectClassified(data);
-        return toText(result, summarizeClassified(result));
       }
     );
 
@@ -1067,17 +1187,21 @@ export class JoomilMCP extends McpAgent<Env> {
         outputSchema: GetCategoriesOutputSchema,
       },
       async ({ parent_id }) => {
-        if (parent_id !== undefined && isRestrictedCategory({ id: parent_id })) {
-          return toText({ categories: [], total: 0 }, summarizeCategories(0));
+        try {
+          if (parent_id !== undefined && isRestrictedCategory({ id: parent_id })) {
+            return toText({ categories: [], total: 0 }, summarizeCategories(0));
+          }
+          const data = await joomilFetch(base, "/api/categories", { parent_id }) as { categories: Array<{ id: number; [key: string]: unknown }>; total: number };
+          const categories = data.categories.filter((cat) => !isRestrictedCategory(cat));
+          const filtered = {
+            ...data,
+            categories,
+            total: categories.length,
+          };
+          return toText(filtered, summarizeCategories(filtered.total));
+        } catch (error) {
+          return toToolError(error);
         }
-        const data = await joomilFetch(base, "/api/categories", { parent_id }) as { categories: Array<{ id: number; [key: string]: unknown }>; total: number };
-        const categories = data.categories.filter((cat) => !isRestrictedCategory(cat));
-        const filtered = {
-          ...data,
-          categories,
-          total: categories.length,
-        };
-        return toText(filtered, summarizeCategories(filtered.total));
       }
     );
 

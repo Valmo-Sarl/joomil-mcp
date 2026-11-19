@@ -183,7 +183,8 @@ Always pass the `name` field (not `label_fr` nor `code`) to the `canton` filter.
 This MCP server is **read-only** and uses **public data only**.
 
 - **No write operations**: cannot create, edit, or delete listings; cannot contact sellers.
-- **No authentication**: no user accounts, no messages, no favorites, no saved searches.
+- **No member login**: no user accounts, no messages, no favorites, no saved searches.
+  A private worker-to-origin service credential does not grant access to private data.
 - **No seller contact**: phone numbers and email addresses are not exposed — use the listing `url` to open Joomil.ch directly.
 - **No posting**: publishing an ad must be done on joomil.ch.
 - **Restricted categories**: Erotique (28), Rencontres & Amitié (14000), Voyance & Astrologie (651), and their descendants are filtered out by the MCP layer per content policy. The underlying PHP API remains available for direct use.
@@ -193,13 +194,43 @@ This MCP server is **read-only** and uses **public data only**.
 
 ## Deploy Your Own
 
-```bash
-git clone https://github.com/Valmo-Sarl/joomil-mcp
-cd joomil-mcp
-npm install
-npx wrangler login
-npm run deploy
-```
+### v1.3.0 — deployed and verified on 2026-11-19
+
+Production v1.3.0 separates MCP and direct REST quotas. Its five tools were
+verified before and after the coordinated PHP origin rollout. Clients still
+connect anonymously; the operator must provision
+`JOOMIL_API_TOKEN` as a **Worker secret**, with the matching SHA-256 and an
+explicit service limit at the Joomil origin. A self-hosted copy does not
+automatically obtain a privileged origin service budget.
+
+- Active: 60 **tool calls/session/minute**, plus 600 ingress GET/POST/IP/minute.
+  Tool checks use the initialized SDK Durable Object, including batched calls.
+- These native limits are **approximate per Cloudflare location**, not strict
+  global limits or authenticated-person allowances. Sessions can be recreated;
+  NATs/AI providers may share ingress IPs. A separate atomic origin service cap
+  bounds aggregate upstream traffic.
+- `MCP_SESSION_LIMITER` / `MCP_IP_LIMITER` use namespaces `2026111901` /
+  `2026111902`, checked unused before deployment and now reserved to these uses.
+  Verify account-wide uniqueness before assigning new namespaces.
+- Missing service secret/bindings fail closed (503), exceeded budgets give429.
+  No User-Agent/IP-header exemption. No origin redirect follows the secret.
+- `.dev.vars.example` is empty by design. Do not commit a real `.dev.vars`,
+  put a secret in `[vars]`, paste it in chat, or send it in a URL.
+- Wrangler >=4.36 required. Run `npm run typecheck` and `npm test` offline before
+  any deployment. Tests use fictitious credentials and intercept all origin calls;
+  the protocol test runs the real SDK/DO transport in Miniflare/workerd.
+- No deployment, registry publication or secret provisioning is performed by
+  tests. Coordinate worker-first rollout with the origin; rolling back blindly
+  to v1.2.1 afterwards would lose the service credential and re-share direct quotas.
+
+Operator's canonical plan in the workspace:
+`../my.joomil.ch/docs/operations/explicit-schema-preparation-2026-11-19/MCP-QUOTAS.md`.
+Deployment evidence and safe recovery:
+`../my.joomil.ch/docs/operations/explicit-schema-preparation-2026-11-19/DEPLOYMENT-STATUS.md`.
+Cloudflare version `0b412245-e585-4e35-9bc9-761bdbf537e2`, 100% traffic;
+existing Durable Object/storage preserved. Not published to the MCP registry by
+this rollout. Christophe subsequently requested a dedicated commit, tag and push
+of this release in both repositories.
 
 ## License
 

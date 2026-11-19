@@ -13,3 +13,17 @@ class_name = "JoomilMCP"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["JoomilMCP"]
+
+# Approved and deployed 2026-11-19; these namespaces are reserved to this worker.
+# Native counters are approximate and per Cloudflare location, not per user account.
+[[ratelimits]]
+name = "MCP_SESSION_LIMITER"
+namespace_id = "2026111901"
+simple = { limit = 60, period = 60 }
+
+[[ratelimits]]
+name = "MCP_IP_LIMITER"
+namespace_id = "2026111902"
+simple = { limit = 600, period = 60 }
+
+# JOOMIL_API_TOKEN is a Worker secret, never a plaintext [vars] value.

@@ -1,0 +1,3 @@
+# Local fixtures only. Use an explicit test-generated base64url token (>=32 bytes).
+# Never put a production secret in this file or commit a filled .dev.vars.
+JOOMIL_API_TOKEN=

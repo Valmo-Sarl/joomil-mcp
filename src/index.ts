@@ -1,6 +1,7 @@
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { apiRequest, guardMcpRequest, guardMcpTool, type AccessEnv } from "./access";
 
 /**
  * Joomil MCP Server
@@ -16,7 +17,7 @@ import { z } from "zod";
  * Data source: Joomil public REST API (www.joomil.ch/api/*)
  */
 
-interface Env {
+interface Env extends AccessEnv {
   JOOMIL_API_BASE: string;
 }
 
@@ -137,22 +138,14 @@ class JoomilApiError extends Error {
 async function joomilFetch(
   baseUrl: string,
   path: string,
-  params: Record<string, string | number | undefined> = {}
+  params: Record<string, string | number | undefined>,
+  token: string
 ): Promise<unknown> {
-  const url = new URL(`${baseUrl}${path}`);
-
-  for (const [key, value] of Object.entries(params)) {
-    if (value !== undefined && value !== "") {
-      url.searchParams.set(key, String(value));
-    }
-  }
-
-  const response = await fetch(url.toString(), {
-    headers: { "User-Agent": "joomil-mcp/1.2.1" },
-  });
+  const request = apiRequest(baseUrl, path, params, token);
+  const response = await fetch(request);
 
   if (!response.ok) {
-    throw new JoomilApiError(response.status, response.statusText, url.toString());
+    throw new JoomilApiError(response.status, response.statusText, request.url);
   }
 
   return response.json();
@@ -340,13 +333,13 @@ let categoryCache: {
   categories: ApiCategory[];
 } | null = null;
 
-async function getCachedCategories(baseUrl: string): Promise<ApiCategory[]> {
+async function getCachedCategories(baseUrl: string, token: string): Promise<ApiCategory[]> {
   const now = Date.now();
   if (categoryCache && categoryCache.baseUrl === baseUrl && categoryCache.expiresAt > now) {
     return categoryCache.categories;
   }
 
-  const data = await joomilFetch(baseUrl, "/api/categories") as { categories: ApiCategory[] };
+  const data = await joomilFetch(baseUrl, "/api/categories", {}, token) as { categories: ApiCategory[] };
   categoryCache = {
     baseUrl,
     expiresAt: now + CATEGORY_CACHE_TTL_MS,
@@ -972,11 +965,25 @@ function projectClassified(data: unknown) {
 export class JoomilMCP extends McpAgent<Env> {
   server = new McpServer({
     name: "joomil-mcp",
-    version: "1.2.1",
+    version: "1.3.0",
   });
+
+  private async checkToolQuota() {
+    let status: 429 | 503 | null;
+    try {
+      status = await guardMcpTool(this.env, this.ctx.id.toString());
+    } catch {
+      status = 503;
+    }
+    return status === null ? null : toError({
+      error: status === 429 ? "Too many tool calls" : "Service temporarily unavailable",
+      status, retry_after: status === 429 ? 60 : 5,
+    });
+  }
 
   async init(): Promise<void> {
     const base = this.env.JOOMIL_API_BASE ?? "https://www.joomil.ch";
+    const token = this.env.JOOMIL_API_TOKEN;
 
     // ============================================================================
     // Tool : suggest_filters
@@ -1003,8 +1010,10 @@ export class JoomilMCP extends McpAgent<Env> {
         outputSchema: SuggestFiltersOutputSchema,
       },
       async ({ query }) => {
+        const denied = await this.checkToolQuota();
+        if (denied) return denied;
         try {
-          const categories = await getCachedCategories(base);
+          const categories = await getCachedCategories(base, token);
           const suggestion = buildFilterSuggestion(query, categories);
           return toText(suggestion, summarizeSuggestion(suggestion));
         } catch (error) {
@@ -1090,6 +1099,8 @@ export class JoomilMCP extends McpAgent<Env> {
         outputSchema: SearchClassifiedsOutputSchema,
       },
       async ({ q, cat_id, canton, location, price_min, price_max, sort, limit, offset }) => {
+        const denied = await this.checkToolQuota();
+        if (denied) return denied;
         try {
           if (cat_id !== undefined && isRestrictedCategory({ id: cat_id })) {
             return restrictedCategoryError();
@@ -1104,7 +1115,7 @@ export class JoomilMCP extends McpAgent<Env> {
             sort,
             limit,
             offset,
-          });
+          }, token);
           const result = projectSearchResult(data);
           return toText(result, summarizeSearchResult(result));
         } catch (error) {
@@ -1142,8 +1153,10 @@ export class JoomilMCP extends McpAgent<Env> {
         outputSchema: GetClassifiedOutputSchema,
       },
       async ({ id }) => {
+        const denied = await this.checkToolQuota();
+        if (denied) return denied;
         try {
-          const data = await joomilFetch(base, `/api/classifieds/${id}`);
+          const data = await joomilFetch(base, `/api/classifieds/${id}`, {}, token);
           const ad = (data as { ad?: DetailAd }).ad;
           if (isRestrictedCategory(ad?.category)) {
             return restrictedCategoryError();
@@ -1187,11 +1200,13 @@ export class JoomilMCP extends McpAgent<Env> {
         outputSchema: GetCategoriesOutputSchema,
       },
       async ({ parent_id }) => {
+        const denied = await this.checkToolQuota();
+        if (denied) return denied;
         try {
           if (parent_id !== undefined && isRestrictedCategory({ id: parent_id })) {
             return toText({ categories: [], total: 0 }, summarizeCategories(0));
           }
-          const data = await joomilFetch(base, "/api/categories", { parent_id }) as { categories: Array<{ id: number; [key: string]: unknown }>; total: number };
+          const data = await joomilFetch(base, "/api/categories", { parent_id }, token) as { categories: Array<{ id: number; [key: string]: unknown }>; total: number };
           const categories = data.categories.filter((cat) => !isRestrictedCategory(cat));
           const filtered = {
             ...data,
@@ -1232,6 +1247,8 @@ export class JoomilMCP extends McpAgent<Env> {
         outputSchema: GetCantonsOutputSchema,
       },
       async () => {
+        const denied = await this.checkToolQuota();
+        if (denied) return denied;
         const result = { cantons: SUPPORTED_CANTONS, total: SUPPORTED_CANTONS.length };
         return toText(result, summarizeCantons(result.total));
       }
@@ -1240,7 +1257,9 @@ export class JoomilMCP extends McpAgent<Env> {
 }
 
 export default {
-  fetch: (request: Request, env: Env, ctx: ExecutionContext) => {
+  fetch: async (request: Request, env: Env, ctx: ExecutionContext) => {
+    const failure = await guardMcpRequest(request, env);
+    if (failure) return failure;
     return JoomilMCP.serve("/mcp").fetch(request, env, ctx);
   },
 } satisfies ExportedHandler<Env>;

@@ -1,0 +1,102 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "joomil",
+  "version": "1.0.0",
+  "description": "Search active public listings from the Swiss classifieds marketplace Joomil.ch.",
+  "author": {
+    "name": "Valmo Sàrl",
+    "url": "https://www.joomil.ch/"
+  },
+  "homepage": "https://www.joomil.ch/",
+  "repository": "https://github.com/Valmo-Sarl/joomil-mcp",
+  "keywords": ["classifieds", "Switzerland", "petites annonces", "Suisse"],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Joomil",
+        "shortDescription": "Swiss classifieds search",
+        "longDescription": "Search active public listings from Joomil.ch by category, canton, keyword and budget. Check published prices and open listings on Joomil.ch. The plugin is read-only and does not post listings, message sellers or process payments. Listing availability cannot be guaranteed.",
+        "developerName": "Valmo Sàrl",
+        "category": "Productivity",
+        "capabilities": ["Search public listings", "Read listing details", "Look up categories and cantons"],
+        "websiteURL": "https://www.joomil.ch/",
+        "supportURL": "https://support.joomil.ch/helpdesk/assistance-3",
+        "privacyPolicyURL": "https://www.joomil.ch/petitesannonces/protection-donnees/cms/85",
+        "termsOfServiceURL": "https://www.joomil.ch/petitesannonces/conditions-generales-utilisation/cms/80",
+        "defaultPrompt": [
+          "Cherche des vélos d’occasion à moins de CHF 500 dans le canton de Vaud.",
+          "Trouve des livres disponibles en Valais et donne-moi les liens.",
+          "Ouvre cette annonce Joomil et indique son prix et sa localité."
+        ],
+        "composerIcon": "./assets/joomil.png",
+        "logo": "./assets/joomil.png"
+      },
+      "review": {
+        "test_cases": {
+          "positive": [
+            {
+              "description": "Determine the exact canton filter",
+              "prompt": "Quelle valeur exacte faut-il passer au filtre de canton pour Vaud ?",
+              "tools_triggered": "get_cantons",
+              "expected_behavior": "Return Vaud as the accepted name, with VD as the canton code, without using VD as the filter."
+            },
+            {
+              "description": "Find the bicycles category",
+              "prompt": "Liste les catégories Joomil sous le parent 73 et donne l’identifiant de Vélos.",
+              "tools_triggered": "get_categories",
+              "expected_behavior": "Identify Vélos as category 78 beneath parent 73. Do not describe the category metadata count as active matching listings."
+            },
+            {
+              "description": "Convert a French budget request to search filters",
+              "prompt": "Suggère les filtres pour : vélo complet d’occasion à moins de CHF 500 dans le canton de Vaud.",
+              "tools_triggered": "suggest_filters",
+              "expected_behavior": "Return cat_id 78, Vaud, price_max 500, and no locality. Do not invent a structured used-condition filter."
+            },
+            {
+              "description": "Search active listings using explicit filters",
+              "prompt": "Cherche dans la catégorie Vélos (78), canton Vaud, jusqu’à CHF 499.99. Donne jusqu’à trois vélos complets avec leurs liens et ne compte pas les accessoires.",
+              "tools_triggered": "search_classifieds",
+              "expected_behavior": "Return matching bicycle listings with prices and links, or state that no complete bikes were found in the pages searched. Never present accessories as bicycles."
+            },
+            {
+              "description": "Read the detail of a result",
+              "prompt": "Cherche une annonce active dans Livres, BD & Revues (20), puis ouvre le détail d’un résultat et indique son titre, prix et lien.",
+              "tools_triggered": "search_classifieds, get_classified",
+              "expected_behavior": "Use the ID discovered in the current search and return the matching public listing. If the listing changed since the search, report that it is not available."
+            }
+          ],
+          "negative": [
+            {
+              "description": "Expired public web page is out of connector scope",
+              "prompt": "Vérifie via Joomil si l’annonce 387721 est disponible, sans ouvrir le navigateur.",
+              "tools_triggered": "get_classified",
+              "expected_behavior": "Report that the listing is not available through the connector. Do not claim it was deleted from the website."
+            },
+            {
+              "description": "Contradictory price range",
+              "prompt": "Teste le filtre Joomil de CHF 500 minimum et CHF 100 maximum, sans inverser automatiquement les montants.",
+              "tools_triggered": "search_classifieds",
+              "expected_behavior": "Ask for corrected bounds or report the tool's validation error. Do not make an unfiltered search."
+            },
+            {
+              "description": "Restricted category cannot be queried",
+              "prompt": "Vérifie si le connecteur permet de rechercher dans la catégorie Joomil 28. Ne renvoie pas de contenu ni de lien de cette catégorie.",
+              "tools_triggered": "search_classifieds",
+              "expected_behavior": "Do not return listings or links from category 28 or its descendants. Do not fall back to an external search."
+            }
+          ]
+        },
+        "commerce_description": "Read-only lookup of public classified listings and source links. No contact, purchase, checkout or payment tool."
+      },
+      "publication": {
+        "release_notes": "Initial plugin package for the Joomil public search connector.",
+        "translations": {
+          "fr-FR": {
+            "subtitle": "Petites annonces suisses",
+            "description": "Recherche des annonces actives sur Joomil.ch par catégorie, canton, mot-clé ou budget. Consulte les prix publiés et les liens vers les annonces. Le connecteur est en lecture seule : ni publication, ni messagerie, ni paiement."
+          }
+        }
+      }
+    }
+  }
+}

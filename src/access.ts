@@ -74,11 +74,21 @@ export async function guardMcpRequest(request: Request, env: AccessEnv): Promise
 
 /** SDK/DO ID, not an unverified caller header. Still a session, NOT an account. */
 export async function guardMcpTool(env: AccessEnv, sessionName: string): Promise<429 | 503 | null> {
+  return guardToolScope(env, "session", sessionName);
+}
+
+/** Modern MCP has no session; separately bound tool calls by the trusted ingress peer. */
+export async function guardStatelessMcpTool(env: AccessEnv, request: Request): Promise<429 | 503 | null> {
+  const peer = normalizedIp(request.headers.get("CF-Connecting-IP"));
+  return peer ? guardToolScope(env, "stateless-peer", peer) : 503;
+}
+
+async function guardToolScope(env: AccessEnv, scope: string, identity: string): Promise<429 | 503 | null> {
   if (!validServiceToken(env.JOOMIL_API_TOKEN) || !env.MCP_SESSION_LIMITER
-    || typeof sessionName !== "string" || !sessionName || sessionName.length > 512) return 503;
+    || typeof identity !== "string" || !identity || identity.length > 512) return 503;
   try {
     const result = await env.MCP_SESSION_LIMITER.limit({
-      key: await limiterKey(env.JOOMIL_API_TOKEN, "session", sessionName),
+      key: await limiterKey(env.JOOMIL_API_TOKEN, scope, identity),
     });
     if (typeof result?.success !== "boolean") return 503;
     return result.success ? null : 429;
@@ -105,7 +115,7 @@ export function apiRequest(
   // Workers supports follow/manual, not the browser's "error" mode.
   // joomilFetch rejects every non-2xx response, including redirects.
   return new Request(url, { redirect: "manual", headers: {
-    "User-Agent": "joomil-mcp/1.3.0",
+    "User-Agent": "joomil-mcp/1.3.3",
     "X-Joomil-MCP-Token": token,
   } });
 }

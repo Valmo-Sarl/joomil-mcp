@@ -13,7 +13,7 @@ try {
   await rm(dir, { recursive: true });
 }
 const TOKEN = "M".repeat(43); // Explicitly fictitious; no live variables are loaded.
-const { apiRequest, guardMcpRequest, guardMcpTool } = access;
+const { apiRequest, guardMcpRequest, guardMcpTool, guardStatelessMcpTool } = access;
 function limiter(max) {
   const keys = [], counts = new Map();
   return { keys, async limit({ key }) {
@@ -56,6 +56,17 @@ test("IP churn cannot reset the session budget", async () => {
   assert.equal(await guardMcpTool(env, "sdk-session-a"), 429);
 });
 
+test("stateless tool quotas use the trusted peer without affecting legacy session quotas", async () => {
+  const env = environment(1);
+  assert.equal(await guardStatelessMcpTool(env, request("unused-a")), null);
+  assert.equal(await guardStatelessMcpTool(env, request("unused-b", {
+    headers: { "X-Forwarded-For": "198.51.100.2" },
+  })), 429);
+  assert.equal(await guardMcpTool(env, "192.0.2.1"), null, "Separate HMAC scopes");
+  assert.equal(await guardStatelessMcpTool(env, request(null, { peer: "192.0.2.2" })), null);
+  assert.equal(await guardStatelessMcpTool(env, request(null, { peer: "" })), 503);
+});
+
 test("aggregate bounds new-session churn; no claim of per-person identity", async () => {
   const env = environment(10, 2);
   assert.equal(await guardMcpRequest(request(null), env), null);
@@ -89,8 +100,10 @@ test("IPv6 is canonicalized and keys contain no raw peer/session/secret", async 
 
 test("each tool consumes a unit even when transport messages are batched", async () => {
   const env = environment(2);
-  assert.deepEqual(await Promise.all([1, 2, 3].map(() => guardMcpTool(env, "sdk-session-a"))),
-    [null, null, 429]);
+  const outcomes = await Promise.all([1, 2, 3].map(() => guardMcpTool(env, "sdk-session-a")));
+  // Concurrent HMACs can reach the limiter in a different order.
+  assert.equal(outcomes.filter((status) => status === null).length, 2);
+  assert.equal(outcomes.filter((status) => status === 429).length, 1);
   assert.equal(env.MCP_SESSION_LIMITER.keys.length, 3);
   assert.equal(await guardMcpTool(env, "sdk-session-b"), null);
   assert.equal(await guardMcpTool(env, ""), 503);

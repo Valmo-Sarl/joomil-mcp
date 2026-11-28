@@ -1,7 +1,11 @@
 import { McpAgent } from "agents/mcp";
+import { createMcpHandler } from "agents/mcp/server";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer as ModernMcpServer, isLegacyRequest } from "@modelcontextprotocol/server";
 import { z } from "zod";
-import { apiRequest, guardMcpRequest, guardMcpTool, type AccessEnv } from "./access";
+import { apiRequest, guardMcpRequest, guardMcpTool, guardStatelessMcpTool, type AccessEnv } from "./access";
+import { buildTaxonomy, hasRestrictedPath, restrictedRoots, suggestCategory,
+  type CategorySuggestion, type Taxonomy } from "./taxonomy";
 
 /**
  * Joomil MCP Server
@@ -21,66 +25,21 @@ interface Env extends AccessEnv {
   JOOMIL_API_BASE: string;
 }
 
-/**
- * Restricted categories — excluded from the MCP layer per content policy.
- * The underlying PHP API remains fully accessible for direct use.
- *
- * Root IDs:
- *   28    = Erotique
- *   14000 = Rencontres & Amitié
- *   651   = Voyance & Astrologie
- *
- * Descendant IDs are included because the upstream API accepts them directly.
- * URL/path slug checks provide a second guard if the upstream tree changes.
- */
-const RESTRICTED_CATEGORY_IDS = new Set([
-  28, 14000, 651,
-  14250, 14100, 11024, 11025, 14200,
-  657, 656, 14350, 14300, 663,
-  658, 659, 660, 661, 16035,
-  662, 11027, 650,
-  246, 245, 243, 242, 649, 655,
-  653, 652, 654,
-]);
-
-const RESTRICTED_CATEGORY_SLUGS = [
-  "erotique",
-  "rencontres-amitie",
-  "voyance-astrologie",
-];
-
 interface CategoryLike {
   id?: number;
-  parent_id?: number;
   name?: string;
   url?: string;
   full_path?: string;
 }
 
-function containsRestrictedSlug(value: string | undefined): boolean {
-  if (!value) return false;
-  const normalized = value.toLowerCase();
-  return RESTRICTED_CATEGORY_SLUGS.some(
-    (slug) =>
-      normalized.includes(`/${slug}/`) ||
-      normalized.startsWith(`${slug}/`) ||
-      normalized.startsWith(`${slug}-`) ||
-      normalized.includes(`-${slug}-`)
-  );
-}
-
-function isRestrictedCategory(category: CategoryLike | null | undefined): boolean {
-  if (!category) return false;
-  return (
-    (category.id !== undefined && RESTRICTED_CATEGORY_IDS.has(category.id)) ||
-    (category.parent_id !== undefined && RESTRICTED_CATEGORY_IDS.has(category.parent_id)) ||
-    containsRestrictedSlug(category.url) ||
-    containsRestrictedSlug(category.full_path)
-  );
+function isAllowedCategory(taxonomy: Taxonomy, category?: CategoryLike | null, parent?: number | null): boolean {
+  const path = category?.id === undefined ? undefined : taxonomy.paths.get(category.id);
+  return !!path && !hasRestrictedPath(category?.url) && !hasRestrictedPath(category?.full_path)
+    && (parent == null || path.some((item) => item.id === parent));
 }
 
 function restrictedCategoryError() {
-  return toError({ error: "This category is not available through this API." });
+  return toError({ error: "This category is not available through this API.", status: 404 });
 }
 
 /**
@@ -120,14 +79,13 @@ const SUPPORTED_CANTONS: readonly CantonDef[] = [
 const CANTON_NAMES = SUPPORTED_CANTONS.map((c) => c.name) as [string, ...string[]];
 const DEFAULT_SEARCH_LIMIT = 20;
 const CATEGORY_CACHE_TTL_MS = 10 * 60 * 1000;
+const MCP_REQUEST_MAX_BYTES = 64 * 1024;
+const SERVER_INFO = { name: "joomil-mcp", version: "1.3.3" };
+const ACTIVE_SCOPE = "active_general_v1";
 
 class JoomilApiError extends Error {
-  constructor(
-    public readonly status: number,
-    public readonly statusText: string,
-    public readonly url: string
-  ) {
-    super(`Joomil API error ${status}: ${statusText}`);
+  constructor(public readonly status: number, message: string) {
+    super(message);
   }
 }
 
@@ -142,13 +100,33 @@ async function joomilFetch(
   token: string
 ): Promise<unknown> {
   const request = apiRequest(baseUrl, path, params, token);
-  const response = await fetch(request);
+  const signal = AbortSignal.timeout(8000);
+  try {
+    const response = await fetch(request, { signal });
 
-  if (!response.ok) {
-    throw new JoomilApiError(response.status, response.statusText, request.url);
+    if (!response.ok) {
+      void response.body?.cancel().catch(() => {});
+      throw new JoomilApiError(response.status, response.status === 404
+        ? "Joomil listing was not found or is no longer public."
+        : "Joomil API request failed.");
+    }
+
+    return await response.json();
+  } catch (error) {
+    if (error instanceof JoomilApiError) throw error;
+    throw new JoomilApiError(signal.aborted ? 504 : 502, signal.aborted
+      ? "Joomil API timed out. Try again later."
+      : "Joomil API returned an invalid or unavailable response.");
   }
+}
 
-  return response.json();
+async function fetchActiveInventory(base: string, path: string, params: Record<string, string | number | undefined>, token: string) {
+  const payload = await joomilFetch(base, path, { ...params, scope: ACTIVE_SCOPE }, token);
+  // Older origins ignore unknown query parameters. Do not silently serve their unfiltered inventory.
+  if ((payload as { scope?: unknown } | null)?.scope !== ACTIVE_SCOPE) {
+    throw new JoomilApiError(503, "Joomil active inventory is temporarily unavailable.");
+  }
+  return payload;
 }
 
 function toError(data: Record<string, unknown>) {
@@ -161,16 +139,14 @@ function toError(data: Record<string, unknown>) {
 function toToolError(error: unknown) {
   if (error instanceof JoomilApiError) {
     return toError({
-      error: "Joomil API request failed",
+      error: error.message,
       status: error.status,
-      status_text: error.statusText,
-      url: error.url,
     });
   }
 
   return toError({
-    error: "Unexpected MCP error",
-    message: error instanceof Error ? error.message : String(error),
+    error: "Joomil MCP could not process the request.",
+    status: 502,
   });
 }
 
@@ -242,7 +218,7 @@ const ClassifiedOutputSchema = SearchAdOutputSchema.extend({
   }).nullable(),
   images: z.array(z.string()),
   expires_at: z.string().nullable(),
-  boost: z.number().nullable(),
+  boost: z.enum(["star", "flash"]).nullable(),
   seller: z.object({
     name: z.string().nullable(),
     certified: z.boolean(),
@@ -258,7 +234,7 @@ const ApiCategoryOutputSchema = z.object({
   parent_id: z.number(),
   ad_count: z.number().optional(),
   allow_ads: z.boolean().optional(),
-}).passthrough();
+});
 
 const CantonOutputSchema = z.object({
   name: z.string(),
@@ -318,34 +294,25 @@ const SuggestFiltersOutputSchema = {
   next_step: z.string(),
 };
 
-interface ApiCategory extends CategoryLike {
-  id: number;
-  name: string;
-  url: string;
-  parent_id: number;
-  ad_count?: number;
-  allow_ads?: boolean;
-}
-
 let categoryCache: {
   baseUrl: string;
   expiresAt: number;
-  categories: ApiCategory[];
+  taxonomy: Taxonomy;
 } | null = null;
 
-async function getCachedCategories(baseUrl: string, token: string): Promise<ApiCategory[]> {
+async function getCachedTaxonomy(baseUrl: string, token: string): Promise<Taxonomy> {
   const now = Date.now();
   if (categoryCache && categoryCache.baseUrl === baseUrl && categoryCache.expiresAt > now) {
-    return categoryCache.categories;
+    return categoryCache.taxonomy;
   }
 
-  const data = await joomilFetch(baseUrl, "/api/categories", {}, token) as { categories: ApiCategory[] };
-  categoryCache = {
-    baseUrl,
-    expiresAt: now + CATEGORY_CACHE_TTL_MS,
-    categories: data.categories,
-  };
-  return data.categories;
+  const parsed = z.object(GetCategoriesOutputSchema).parse(await joomilFetch(baseUrl, "/api/categories", {}, token));
+  const taxonomy = buildTaxonomy(parsed.categories);
+  if (parsed.total !== parsed.categories.length || !taxonomy.categories.length) {
+    throw new JoomilApiError(503, "Joomil category catalog is temporarily unavailable.");
+  }
+  categoryCache = { baseUrl, expiresAt: now + CATEGORY_CACHE_TTL_MS, taxonomy };
+  return taxonomy;
 }
 
 interface PriceExtraction {
@@ -356,13 +323,6 @@ interface PriceExtraction {
 interface CantonMatch {
   canton: (typeof CANTON_NAMES)[number] | null;
   matched: string | null;
-}
-
-interface CategorySuggestion {
-  category: ApiCategory;
-  confidence: number;
-  reason: string;
-  matchedTerms: string[];
 }
 
 const COMMON_LOCATIONS = [
@@ -400,7 +360,7 @@ const CATEGORY_REMOVE_TERMS = new Set([
   "categorie", "emploi", "emplois", "immobilier", "job", "jobs", "location",
   "louer", "maison", "maisons", "meuble", "meubles", "moto", "motos",
   "scooter", "service", "services", "studio", "vente", "vendre", "vehicule",
-  "vehicules", "velo", "velos", "villa", "villas", "voiture", "voitures",
+  "vehicules", "villa", "villas", "voiture", "voitures",
 ]);
 
 function normalizeText(value: string): string {
@@ -446,6 +406,11 @@ function parseAmount(value: string): number | null {
 }
 
 const AMOUNT_PATTERN = String.raw`(?:CHF\s*)?(\d+(?:[\s'’.,]\d{3})*(?:[,.]\d{1,2})?|\d+(?:[,.]\d+)?)(?:\s*([kK]))?(?:\s*(?:CHF|francs?))?`;
+// In "à moins de", the à belongs to the price comparison, not the place that
+// follows it. Require a word boundary so a product name ending in a survives.
+const BUDGET_PREPOSITION = String.raw`(?:(?<![\p{L}\p{N}])[aà]\s+)?`;
+const MAX_PRICE_PATTERN = String.raw`(?:${BUDGET_PREPOSITION}moins\s+(?:de|que)|sous|budget(?:\s+de)?|max(?:imum)?|jusqu['’]?a|jusqu'a|jusqu’à|<=|<)\s*${AMOUNT_PATTERN}`;
+const MIN_PRICE_PATTERN = String.raw`(?:${BUDGET_PREPOSITION}plus\s+(?:de|que)|min(?:imum)?|dès|des|from|a\s+partir\s+de|à\s+partir\s+de|>=|>)\s*${AMOUNT_PATTERN}`;
 
 function amountFromCaptures(amountText: string | undefined, suffix: string | undefined): number | null {
   if (!amountText) return null;
@@ -460,14 +425,8 @@ function extractPrices(query: string): PriceExtraction {
     "i"
   );
   const rangePattern = new RegExp(String.raw`\b${AMOUNT_PATTERN}\s*(?:-|–|—)\s*${AMOUNT_PATTERN}\b`, "i");
-  const maxPattern = new RegExp(
-    String.raw`(?:moins\s+de|moins\s+que|sous|budget(?:\s+de)?|max(?:imum)?|jusqu['’]?a|jusqu'a|jusqu’à|<=|<)\s*${AMOUNT_PATTERN}`,
-    "i"
-  );
-  const minPattern = new RegExp(
-    String.raw`(?:plus\s+de|plus\s+que|min(?:imum)?|dès|des|from|a\s+partir\s+de|à\s+partir\s+de|>=|>)\s*${AMOUNT_PATTERN}`,
-    "i"
-  );
+  const maxPattern = new RegExp(MAX_PRICE_PATTERN, "iu");
+  const minPattern = new RegExp(MIN_PRICE_PATTERN, "iu");
   const prefixedCurrencyPattern = /\bCHF\s*(\d+(?:[\s'’.,]\d{3})*(?:[,.]\d{1,2})?|\d+(?:[,.]\d+)?)(?:\s*([kK]))?\b/i;
   const suffixedCurrencyPattern = /\b(\d+(?:[\s'’.,]\d{3})*(?:[,.]\d{1,2})?|\d+(?:[,.]\d+)?)(?:\s*([kK]))?\s*(?:CHF|francs?)\b/i;
   const standaloneKPattern = /\b(\d+(?:[,.]\d+)?)\s*k\b/i;
@@ -513,14 +472,8 @@ function removePricePhrases(query: string): string {
     "gi"
   );
   const rangePattern = new RegExp(String.raw`\b${AMOUNT_PATTERN}\s*(?:-|–|—)\s*${AMOUNT_PATTERN}\b`, "gi");
-  const maxPattern = new RegExp(
-    String.raw`(?:moins\s+de|moins\s+que|sous|budget(?:\s+de)?|max(?:imum)?|jusqu['’]?a|jusqu'a|jusqu’à|<=|<)\s*${AMOUNT_PATTERN}`,
-    "gi"
-  );
-  const minPattern = new RegExp(
-    String.raw`(?:plus\s+de|plus\s+que|min(?:imum)?|dès|des|from|a\s+partir\s+de|à\s+partir\s+de|>=|>)\s*${AMOUNT_PATTERN}`,
-    "gi"
-  );
+  const maxPattern = new RegExp(MAX_PRICE_PATTERN, "giu");
+  const minPattern = new RegExp(MIN_PRICE_PATTERN, "giu");
   const prefixedCurrencyPattern = /\bCHF\s*\d+(?:[\s'’.,]\d{3})*(?:[,.]\d{1,2})?(?:\s*[kK])?\b/gi;
   const suffixedCurrencyPattern = /\b\d+(?:[\s'’.,]\d{3})*(?:[,.]\d{1,2})?(?:\s*[kK])?\s*(?:CHF|francs?)\b/gi;
   const standaloneKPattern = /\b\d+(?:[,.]\d+)?\s*k\b/gi;
@@ -570,24 +523,28 @@ function findCanton(query: string): CantonMatch {
   return { canton: null, matched: null };
 }
 
+const POSTAL_LOCATION = /(?:^|\s)(?:[aà]|in|sur|vers|npa|code(?:\s+postal)?|pr[eè]s\s+de|proche\s+de)\s+(\d{4})\b/i;
+const LOCATION_PREPOSITION = "(?:[aà]|sur|in|près\\s+de|pres\\s+de|proche\\s+de)";
+
 function findLocation(query: string, canton: CantonMatch): string | null {
   const normalizedQuery = normalizeText(query);
 
-  for (const location of COMMON_LOCATIONS) {
+  for (const location of [...COMMON_LOCATIONS].sort((a, b) => b.length - a.length)) {
     const normalizedLocation = normalizeText(location);
     const isCantonPhrase =
       normalizedQuery.includes(`canton de ${normalizedLocation}`) ||
       normalizedQuery.includes(`canton ${normalizedLocation}`);
 
-    if (!isCantonPhrase && normalizedQuery.includes(normalizedLocation)) {
+    if (!isCantonPhrase && new RegExp(`\\b${escapeRegExp(normalizedLocation)}\\b`).test(normalizedQuery)) {
       return location;
     }
   }
 
-  const postalCode = query.match(/\b\d{4}\b/);
-  if (postalCode?.[0]) return postalCode[0];
+  // A bare four-digit token can be a model year or a price, not a postal code.
+  const postalCode = query.match(POSTAL_LOCATION);
+  if (postalCode?.[1]) return postalCode[1];
 
-  const genericMatch = query.match(/\b(?:à|a|sur|in|près de|pres de|proche de)\s+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ' -]{1,40}|\d{4,5})/i);
+  const genericMatch = query.match(/(?:^|\s)(?:à|a|sur|in|près de|pres de|proche de)\s+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ' -]{1,40})/i);
   if (!genericMatch?.[1]) return null;
 
   const candidate = genericMatch[1]
@@ -618,107 +575,26 @@ function removeCantonPhrase(query: string, canton: CantonMatch): string {
 
 function removeLocationPhrase(query: string, location: string | null): string {
   if (!location) return query;
+  if (/^\d{4}$/.test(location)) {
+    return query.replace(POSTAL_LOCATION, (match, postalCode) => postalCode === location ? " " : match);
+  }
   const escaped = escapeRegExp(location);
   return query
-    .replace(new RegExp(`\\b(?:à|a|sur|in|près\\s+de|pres\\s+de|proche\\s+de)\\s+${escaped}\\b`, "gi"), " ")
-    .replace(new RegExp(`\\b${escaped}\\b`, "gi"), " ");
-}
-
-function includesAll(value: string, required: string[]): boolean {
-  return required.every((part) => value.includes(part));
-}
-
-function categoryHintScore(category: ApiCategory, normalizedQuery: string, queryTokens: Set<string>) {
-  const normalizedUrl = normalizeText(category.url);
-  const hints: Array<{ terms: string[]; urlParts: string[]; score: number; reason: string }> = [
-    { terms: ["appartement", "appart", "studio", "logement"], urlParts: ["immobilier", "appartements"], score: 24, reason: "requête immobilière appartement" },
-    { terms: ["maison", "villa"], urlParts: ["immobilier", "maisons-villas"], score: 24, reason: "requête immobilière maison" },
-    { terms: ["terrain", "parcelle"], urlParts: ["immobilier", "terrains"], score: 22, reason: "requête immobilière terrain" },
-    { terms: ["voiture", "auto", "automobile", "vehicule", "golf", "tesla", "bmw", "audi", "mercedes", "renault", "peugeot", "toyota"], urlParts: ["automobiles", "voitures-de-tourisme"], score: 24, reason: "requête automobile" },
-    { terms: ["moto", "scooter"], urlParts: ["motos-deux-roues"], score: 20, reason: "requête moto/deux-roues" },
-    { terms: ["emploi", "job", "travail", "poste"], urlParts: ["emplois-services"], score: 18, reason: "requête emploi/service" },
-    { terms: ["canape", "sofa", "fauteuil", "table", "chaise", "lit", "armoire", "meuble"], urlParts: ["mobilier-decoration"], score: 20, reason: "requête mobilier" },
-    { terms: ["iphone", "telephone", "smartphone", "natel"], urlParts: ["telephonie-natels"], score: 20, reason: "requête téléphonie" },
-    { terms: ["ordinateur", "pc", "macbook", "imac", "laptop"], urlParts: ["informatique"], score: 18, reason: "requête informatique" },
-    { terms: ["velo", "vtt", "bike"], urlParts: ["sport-loisirs"], score: 14, reason: "requête sport/vélo" },
-  ];
-
-  for (const hint of hints) {
-    const matched = hint.terms.filter((term) => normalizedQuery.includes(term) || queryTokens.has(stemToken(term)));
-    if (matched.length > 0 && includesAll(normalizedUrl, hint.urlParts)) {
-      return { score: hint.score + matched.length * 2, reason: hint.reason, terms: matched };
-    }
-  }
-
-  return { score: 0, reason: "", terms: [] };
-}
-
-function scoreCategory(category: ApiCategory, query: string): CategorySuggestion | null {
-  const normalizedQuery = normalizeText(query);
-  const queryTokens = new Set(tokenize(query));
-  const categoryTokens = new Set(tokenize(`${category.name} ${category.url}`));
-  const matchedTerms: string[] = [];
-  let score = 0;
-  let reason = "";
-
-  for (const token of queryTokens) {
-    if (categoryTokens.has(token)) {
-      matchedTerms.push(token);
-      score += 4;
-    }
-  }
-
-  const hint = categoryHintScore(category, normalizedQuery, queryTokens);
-  if (hint.score > 0) {
-    score += hint.score;
-    reason = hint.reason;
-    matchedTerms.push(...hint.terms);
-  }
-
-  if (normalizedQuery.match(/\b(location|louer|loyer)\b/) && category.url.includes("/locations/")) score += 8;
-  if (normalizedQuery.match(/\b(vente|vendre|acheter|achat)\b/) && category.url.includes("/ventes/")) score += 8;
-  if (category.url.includes("cherche-a-")) score -= 6;
-  if (category.allow_ads) score += 1;
-  if (category.ad_count) score += Math.min(4, Math.log10(category.ad_count + 1));
-
-  if (score < 8) return null;
-
-  const confidence = Math.min(0.95, Math.max(0.45, score / 40));
-  return {
-    category,
-    confidence: Number(confidence.toFixed(2)),
-    reason: reason || `mots-clés proches de "${category.name}"`,
-    matchedTerms: Array.from(new Set(matchedTerms)),
-  };
-}
-
-function suggestCategory(categories: ApiCategory[], query: string): CategorySuggestion | null {
-  const suggestions = categories
-    .filter((category) => !isRestrictedCategory(category))
-    .map((category) => scoreCategory(category, query))
-    .filter((suggestion): suggestion is CategorySuggestion => suggestion !== null)
-    .sort((a, b) => {
-      if (b.confidence !== a.confidence) return b.confidence - a.confidence;
-      return (b.category.ad_count ?? 0) - (a.category.ad_count ?? 0);
-    });
-
-  return suggestions[0] ?? null;
+    .replace(new RegExp(`(^|\\s)${LOCATION_PREPOSITION}\\s+${escaped}(?=$|[^\\p{L}\\p{N}-])`, "giu"), " ")
+    .replace(new RegExp(`(^|[^\\p{L}\\p{N}-])${escaped}(?=$|[^\\p{L}\\p{N}-])`, "giu"), "$1 ");
 }
 
 function buildCleanQuery(
-  query: string,
+  queryWithoutPrice: string,
   canton: CantonMatch,
   location: string | null,
   category: CategorySuggestion | null
 ): string | null {
-  let cleaned = removePricePhrases(query);
-  cleaned = removeCantonPhrase(cleaned, canton);
+  let cleaned = removeCantonPhrase(queryWithoutPrice, canton);
   cleaned = removeLocationPhrase(cleaned, location);
 
-  const removableTerms = new Set(CATEGORY_REMOVE_TERMS);
-  for (const term of category?.matchedTerms ?? []) {
-    if (CATEGORY_REMOVE_TERMS.has(term)) removableTerms.add(term);
-  }
+  // Without a category filter, dropping product words can silently broaden the search.
+  const removableTerms = new Set(category?.matchedTerms.filter((term) => CATEGORY_REMOVE_TERMS.has(term)));
 
   const remaining = cleaned
     .split(/\s+/)
@@ -735,17 +611,23 @@ function buildCleanQuery(
   return remaining || null;
 }
 
-function buildFilterSuggestion(query: string, categories: ApiCategory[]) {
+function buildFilterSuggestion(query: string, taxonomy: Taxonomy) {
   const prices = extractPrices(query);
-  const canton = findCanton(query);
-  const location = findLocation(query, canton);
-  const category = suggestCategory(categories, query);
-  const q = buildCleanQuery(query, canton, location, category);
+  const withoutPrice = removePricePhrases(query);
+  const canton = findCanton(withoutPrice);
+  const location = findLocation(withoutPrice, canton);
+  const category = suggestCategory(taxonomy, withoutPrice);
+  const hasUsedCondition = /\bd['’]occasion\b/i.test(withoutPrice);
+  const q = category?.categoryOnly ? null
+    : buildCleanQuery(withoutPrice.replace(/\bd['’]occasion\b/gi, " "), canton, location, category);
   const sort = prices.price_max !== null ? "price_asc" : "recent";
   const warnings: string[] = [];
 
   if (!category) {
     warnings.push("No confident category match. Use get_categories if category precision matters.");
+  }
+  if (hasUsedCondition) {
+    warnings.push("Used condition is not a structured filter; check the listing title and description.");
   }
 
   if (!q && !category && !location && !canton.canton) {
@@ -789,7 +671,7 @@ function buildFilterSuggestion(query: string, categories: ApiCategory[]) {
       : null,
     confidence: Number(confidence.toFixed(2)),
     warnings,
-    next_step: "Call search_classifieds with the filters object. Adjust q or cat_id if the result set is too broad.",
+    next_step: "The filters object can be passed unchanged to search_classifieds.",
   };
 }
 
@@ -857,7 +739,7 @@ interface SearchAd {
   location?: { city?: string; postal_code?: string; canton?: string; country?: string };
   category?: CategoryLike & { id: number; name: string; url: string };
   has_picture?: boolean;
-  boost?: number | null;
+  boost?: "star" | "flash" | null;
   date_published?: string;
   vendor?: { name?: string; certified?: boolean };
 }
@@ -890,9 +772,10 @@ function projectSearchAd(ad: SearchAd) {
   };
 }
 
-function projectSearchResult(data: unknown) {
-  const d = data as { ads?: SearchAd[]; total?: number; limit?: number; offset?: number; has_more?: boolean; next_offset?: number };
-  const ads = (d.ads ?? []).filter((ad) => !isRestrictedCategory(ad.category));
+function projectSearchResult(data: unknown, taxonomy: Taxonomy, catId?: number | null) {
+  const d = data as { ads?: SearchAd[]; total?: number; limit?: number; offset?: number; has_more?: boolean; next_offset?: number } | null;
+  if (!Array.isArray(d?.ads)) throw new JoomilApiError(502, "Joomil API did not return a usable listing page.");
+  const ads = d.ads.filter((ad) => isAllowedCategory(taxonomy, ad?.category, catId));
   return {
     results: ads.map(projectSearchAd),
     total: d.total ?? 0,
@@ -900,7 +783,7 @@ function projectSearchResult(data: unknown) {
     offset: d.offset ?? 0,
     has_more: d.has_more ?? false,
     next_offset: d.next_offset ?? null,
-    filtered_out: (d.ads ?? []).length - ads.length,
+    filtered_out: d.ads.length - ads.length,
   };
 }
 
@@ -921,9 +804,7 @@ interface DetailAd extends SearchAd {
   vendor?: { name?: string; certified?: boolean; is_pro?: boolean; company_name?: string | null };
 }
 
-function projectClassified(data: unknown) {
-  const ad = (data as { ad?: DetailAd }).ad;
-  if (!ad) return data;
+function projectClassified(ad: DetailAd) {
   const vendor = ad.vendor ?? {};
   return {
     id: ad.id,
@@ -962,59 +843,64 @@ function projectClassified(data: unknown) {
   };
 }
 
-export class JoomilMCP extends McpAgent<Env> {
-  server = new McpServer({
-    name: "joomil-mcp",
-    version: "1.3.0",
-  });
+type RegisterJoomilTool = <I extends z.ZodRawShape, O extends z.ZodRawShape>(
+  name: string,
+  config: {
+    title: string; description: string;
+    annotations: { title: string; readOnlyHint: true; destructiveHint: false; openWorldHint: boolean };
+    inputSchema: I; outputSchema: O;
+  },
+  callback: (args: z.output<z.ZodObject<I>>) => Promise<ReturnType<typeof toText> | ReturnType<typeof toError>>,
+) => void;
 
-  private async checkToolQuota() {
-    let status: 429 | 503 | null;
-    try {
-      status = await guardMcpTool(this.env, this.ctx.id.toString());
-    } catch {
-      status = 503;
-    }
+function registerJoomilTools(
+  register: RegisterJoomilTool,
+  env: Env,
+  checkQuota: () => Promise<429 | 503 | null>,
+): void {
+  const checkToolQuota = async () => {
+    const status = await checkQuota().catch(() => 503 as const);
     return status === null ? null : toError({
       error: status === 429 ? "Too many tool calls" : "Service temporarily unavailable",
       status, retry_after: status === 429 ? 60 : 5,
     });
-  }
-
-  async init(): Promise<void> {
-    const base = this.env.JOOMIL_API_BASE ?? "https://www.joomil.ch";
-    const token = this.env.JOOMIL_API_TOKEN;
+  };
+    const base = env.JOOMIL_API_BASE ?? "https://www.joomil.ch";
+    const token = env.JOOMIL_API_TOKEN;
 
     // ============================================================================
     // Tool : suggest_filters
     // ============================================================================
 
-    this.server.registerTool(
+    register(
       "suggest_filters",
       {
+        title: "Suggest Filters",
         description:
-          "Infer search_classifieds filters from a natural-language query. " +
-          "Use this before search_classifieds when the user mentions a category, location, canton or price in free text. " +
-          "Returns a ready-to-use filters object, a category confidence score and warnings for uncertain matches.",
+          "Suggest Joomil listing filters from a short free-text query about a category, place or budget. " +
+          "Returns filters, a category confidence score and warnings, not matching listings.",
         annotations: {
           title: "Suggest Filters",
           readOnlyHint: true,
           destructiveHint: false,
+          openWorldHint: true,
         },
         inputSchema: {
           query: z
             .string()
+            .trim()
             .min(1)
+            .max(500)
             .describe("Natural-language search request, e.g. 'appartement 3 pièces à Sion' or 'Tesla Model 3 moins de 25000 CHF'."),
         },
         outputSchema: SuggestFiltersOutputSchema,
       },
       async ({ query }) => {
-        const denied = await this.checkToolQuota();
+        const denied = await checkToolQuota();
         if (denied) return denied;
         try {
-          const categories = await getCachedCategories(base, token);
-          const suggestion = buildFilterSuggestion(query, categories);
+          const taxonomy = await getCachedTaxonomy(base, token);
+          const suggestion = buildFilterSuggestion(query, taxonomy);
           return toText(suggestion, summarizeSuggestion(suggestion));
         } catch (error) {
           return toToolError(error);
@@ -1026,35 +912,36 @@ export class JoomilMCP extends McpAgent<Env> {
     // Tool : search_classifieds
     // ============================================================================
 
-    this.server.registerTool(
+    register(
       "search_classifieds",
       {
+        title: "Search Classifieds",
         description:
-          "Search classified ads on Joomil.ch — Switzerland's leading French-speaking classifieds marketplace (since 2007). " +
-          "Returns a paginated list of public listings with title, description (truncated to 300 chars), price, location, category and vendor info. " +
-          "All parameters are optional — call with no arguments to browse the latest listings. " +
-          "Use get_classified to fetch full details of a specific listing.",
+          "Search active, unexpired public Joomil.ch classified ads in general-audience categories by keyword, category, place or budget. " +
+          "Returns a paginated list with titles, short descriptions, prices in CHF, locations and listing URLs. " +
+          "With no filters, returns recent listings. No seller contact details or transactions.",
         annotations: {
           title: "Search Classifieds",
           readOnlyHint: true,
           destructiveHint: false,
+          openWorldHint: true,
         },
         inputSchema: {
           q: z
             .string()
-            .optional()
+            .nullish()
             .describe("Full-text search query (searches title and description)"),
           cat_id: z
             .number()
             .int()
             .positive()
-            .optional()
+            .nullish()
             .describe(
               "Category ID filter — includes subcategories automatically. Use get_categories to browse available categories."
             ),
           canton: z
             .enum(CANTON_NAMES)
-            .optional()
+            .nullish()
             .describe(
               "Swiss canton filter — strict enum. Use get_cantons for the official list. " +
               "WARNING: values are API-specific (e.g. 'Bern' not 'Berne', 'Geneve' not 'Genève'/'Geneva'). " +
@@ -1062,17 +949,17 @@ export class JoomilMCP extends McpAgent<Env> {
             ),
           location: z
             .string()
-            .optional()
+            .nullish()
             .describe("City name or postal code (NPA) — partial match"),
           price_min: z
             .number()
             .nonnegative()
-            .optional()
+            .nullish()
             .describe("Minimum price in CHF (inclusive)"),
           price_max: z
             .number()
             .nonnegative()
-            .optional()
+            .nullish()
             .describe("Maximum price in CHF (inclusive)"),
           sort: z
             .enum(["recent", "price_asc", "price_desc", "views"])
@@ -1099,24 +986,29 @@ export class JoomilMCP extends McpAgent<Env> {
         outputSchema: SearchClassifiedsOutputSchema,
       },
       async ({ q, cat_id, canton, location, price_min, price_max, sort, limit, offset }) => {
-        const denied = await this.checkToolQuota();
+        const denied = await checkToolQuota();
         if (denied) return denied;
         try {
-          if (cat_id !== undefined && isRestrictedCategory({ id: cat_id })) {
+          if (cat_id != null && restrictedRoots.has(cat_id)) {
             return restrictedCategoryError();
           }
-          const data = await joomilFetch(base, "/api/classifieds", {
-            q,
-            cat_id,
-            canton,
-            location,
-            price_min,
-            price_max,
+          if (price_min != null && price_max != null && price_min > price_max) {
+            return toError({ error: "Minimum price must not exceed maximum price.", status: 400 });
+          }
+          const taxonomy = await getCachedTaxonomy(base, token);
+          if (cat_id != null && !taxonomy.paths.has(cat_id)) return restrictedCategoryError();
+          const data = await fetchActiveInventory(base, "/api/classifieds", {
+            q: q ?? undefined,
+            cat_id: cat_id ?? undefined,
+            canton: canton ?? undefined,
+            location: location ?? undefined,
+            price_min: price_min ?? undefined,
+            price_max: price_max ?? undefined,
             sort,
             limit,
             offset,
           }, token);
-          const result = projectSearchResult(data);
+          const result = projectSearchResult(data, taxonomy, cat_id);
           return toText(result, summarizeSearchResult(result));
         } catch (error) {
           return toToolError(error);
@@ -1128,18 +1020,19 @@ export class JoomilMCP extends McpAgent<Env> {
     // Tool : get_classified
     // ============================================================================
 
-    this.server.registerTool(
+    register(
       "get_classified",
       {
+        title: "Get Classified",
         description:
           "Get full details of a single classified ad on Joomil.ch by its numeric ID. " +
           "Returns complete description, all images URLs, category breadcrumb (full_path), " +
-          "vendor info (name, certified status, pro company), expiry date and boost level. " +
-          "Use search_classifieds first to find relevant listing IDs.",
+          "public seller info (name, certified status, pro company), expiry date and boost level.",
         annotations: {
           title: "Get Classified",
           readOnlyHint: true,
           destructiveHint: false,
+          openWorldHint: true,
         },
         inputSchema: {
           id: z
@@ -1153,15 +1046,19 @@ export class JoomilMCP extends McpAgent<Env> {
         outputSchema: GetClassifiedOutputSchema,
       },
       async ({ id }) => {
-        const denied = await this.checkToolQuota();
+        const denied = await checkToolQuota();
         if (denied) return denied;
         try {
-          const data = await joomilFetch(base, `/api/classifieds/${id}`, {}, token);
-          const ad = (data as { ad?: DetailAd }).ad;
-          if (isRestrictedCategory(ad?.category)) {
-            return restrictedCategoryError();
+          const taxonomy = await getCachedTaxonomy(base, token);
+          const data = await fetchActiveInventory(base, `/api/classifieds/${id}`, {}, token);
+          const ad = (data as { ad?: DetailAd } | null)?.ad;
+          if (!ad || ad.id !== id || !ad.category || !(ad.category.id > 0)) {
+            return toError({ error: "Joomil API did not return a usable public listing.", status: 502 });
           }
-          const result = projectClassified(data);
+          if (!isAllowedCategory(taxonomy, ad.category)) {
+            return toError({ error: "Joomil listing was not found or is no longer public.", status: 404 });
+          }
+          const result = projectClassified(ad);
           return toText(result, summarizeClassified(result));
         } catch (error) {
           return toToolError(error);
@@ -1173,9 +1070,10 @@ export class JoomilMCP extends McpAgent<Env> {
     // Tool : get_categories
     // ============================================================================
 
-    this.server.registerTool(
+    register(
       "get_categories",
       {
+        title: "Get Categories",
         description:
           "List active categories of the Joomil.ch marketplace. " +
           "Returns a flat list with parent_id for hierarchy reconstruction. " +
@@ -1185,6 +1083,7 @@ export class JoomilMCP extends McpAgent<Env> {
           title: "Get Categories",
           readOnlyHint: true,
           destructiveHint: false,
+          openWorldHint: true,
         },
         inputSchema: {
           parent_id: z
@@ -1200,19 +1099,16 @@ export class JoomilMCP extends McpAgent<Env> {
         outputSchema: GetCategoriesOutputSchema,
       },
       async ({ parent_id }) => {
-        const denied = await this.checkToolQuota();
+        const denied = await checkToolQuota();
         if (denied) return denied;
         try {
-          if (parent_id !== undefined && isRestrictedCategory({ id: parent_id })) {
+          if (parent_id !== undefined && restrictedRoots.has(parent_id)) {
             return toText({ categories: [], total: 0 }, summarizeCategories(0));
           }
-          const data = await joomilFetch(base, "/api/categories", { parent_id }, token) as { categories: Array<{ id: number; [key: string]: unknown }>; total: number };
-          const categories = data.categories.filter((cat) => !isRestrictedCategory(cat));
-          const filtered = {
-            ...data,
-            categories,
-            total: categories.length,
-          };
+          const taxonomy = await getCachedTaxonomy(base, token);
+          const categories = parent_id === undefined
+            ? taxonomy.categories : taxonomy.categories.filter((cat) => cat.parent_id === parent_id);
+          const filtered = { categories, total: categories.length };
           return toText(filtered, summarizeCategories(filtered.total));
         } catch (error) {
           return toToolError(error);
@@ -1230,29 +1126,43 @@ export class JoomilMCP extends McpAgent<Env> {
     // sont ignorées silencieusement -> l'agent croit filtrer mais reçoit tout.
     // Cet outil fige la liste officielle pour empêcher l'hallucination.
 
-    this.server.registerTool(
+    register(
       "get_cantons",
       {
+        title: "Get Cantons",
         description:
           "List the Swiss cantons supported by Joomil's `canton` filter. " +
-          "Returns the exact `name` value to pass to search_classifieds, plus a readable French label. " +
-          "Call this before filtering by canton — the API values are non-obvious " +
-          "(e.g. 'Bern' not 'Berne', 'Geneve' not 'Genève' or 'Geneva').",
+          "Returns the exact `name` value accepted by search_classifieds, plus a readable French label " +
+          "(e.g. 'Bern' rather than 'Berne').",
         annotations: {
           title: "Get Cantons",
           readOnlyHint: true,
           destructiveHint: false,
+          openWorldHint: false,
         },
         inputSchema: {},
         outputSchema: GetCantonsOutputSchema,
       },
       async () => {
-        const denied = await this.checkToolQuota();
+        const denied = await checkToolQuota();
         if (denied) return denied;
         const result = { cantons: SUPPORTED_CANTONS, total: SUPPORTED_CANTONS.length };
         return toText(result, summarizeCantons(result.total));
       }
     );
+}
+
+export class JoomilMCP extends McpAgent<Env> {
+  server = new McpServer(SERVER_INFO);
+
+  async init(): Promise<void> {
+    registerJoomilTools((name, config, callback) => {
+      const inputSchema = z.object(config.inputSchema);
+      const outputSchema = z.object(config.outputSchema);
+      this.server.registerTool<typeof outputSchema, typeof inputSchema>(
+        name, { ...config, inputSchema, outputSchema }, (args) => callback(inputSchema.parse(args)),
+      );
+    }, this.env, () => guardMcpTool(this.env, this.ctx.id.toString()));
   }
 }
 
@@ -1260,6 +1170,18 @@ export default {
   fetch: async (request: Request, env: Env, ctx: ExecutionContext) => {
     const failure = await guardMcpRequest(request, env);
     if (failure) return failure;
-    return JoomilMCP.serve("/mcp").fetch(request, env, ctx);
+    if (new URL(request.url).pathname !== "/mcp" || request.method !== "POST" ||
+      await isLegacyRequest(request, undefined, { maxRequestBodySize: MCP_REQUEST_MAX_BYTES })) {
+      return JoomilMCP.serve("/mcp").fetch(request, env, ctx);
+    }
+    return createMcpHandler(() => {
+      const server = new ModernMcpServer(SERVER_INFO);
+      registerJoomilTools((name, config, callback) => {
+        server.registerTool(name, {
+          ...config, inputSchema: z.object(config.inputSchema), outputSchema: z.object(config.outputSchema),
+        }, callback);
+      }, env, () => guardStatelessMcpTool(env, request));
+      return server;
+    }, { route: "/mcp", legacy: "reject", maxRequestBodySize: MCP_REQUEST_MAX_BYTES, maxSubscriptions: 0 })(request, env, ctx);
   },
 } satisfies ExportedHandler<Env>;

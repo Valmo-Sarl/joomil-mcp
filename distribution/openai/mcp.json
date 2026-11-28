@@ -1,0 +1,9 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "joomil": {
+      "type": "streamable-http",
+      "url": "https://joomil-mcp.snowy-surf-deec.workers.dev/mcp"
+    }
+  }
+}

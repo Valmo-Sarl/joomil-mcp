@@ -1,6 +1,9 @@
 # Joomil MCP Server
 
-Search and browse classified ads from [Joomil.ch](https://www.joomil.ch) — Switzerland's leading French-speaking classifieds marketplace, active since 2007.
+Search and browse classified ads from [Joomil.ch](https://www.joomil.ch), a French-speaking Swiss classifieds marketplace active since 2007.
+
+For submission readiness and the current production contract, see the
+[README](README.md). This guide is not a directory listing or an approval.
 
 ## Tools
 
@@ -58,10 +61,10 @@ Add to your MCP settings:
 ## Data
 
 - **Source**: Joomil.ch public API
-- **Coverage**: ~2,000+ active listings across 34 top-level categories
+- **Coverage**: available public listings, subject to the MCP content restrictions
 - **Location**: Switzerland (French-speaking regions)
 - **Language**: French
-- **Update frequency**: Real-time (no cache on MCP layer)
+- **Update frequency**: live listing reads; filter suggestions cache category metadata briefly
 
 ## Categories
 
@@ -73,4 +76,7 @@ No authentication required — all data is publicly available on Joomil.ch.
 
 ## Rate Limiting
 
-60 requests/minute per IP. Please implement reasonable caching on your side for high-volume use cases.
+The current worker applies 60 tool calls/minute per legacy MCP session or per
+stateless ingress IP (separate keys), and 600 incoming GET/POST requests/minute
+per IP across both protocols, with separate origin limits. See the
+[README](README.md) for details and limitations.
